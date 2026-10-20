@@ -1,5 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "fastapi",
   "regions": ["iad1"],
   "crons": [{ "path": "/keepalive", "schedule": "0 13 * * 1-5" }]
 }
