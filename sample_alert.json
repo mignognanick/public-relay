@@ -1,0 +1,21 @@
+{
+  "_comment": "Paste ONE of the two objects below (without this wrapper) into the TradingView alert 'Message' box. Template uses TradingView placeholders; OCC symbol must be built by your Pine script or typed per-alert since {{ticker}} is the underlying, not the option.",
+  "template": {
+    "passphrase": "REPLACE_WITH_WEBHOOK_PASSPHRASE",
+    "symbol": "{{ticker}}261120C00250000",
+    "side": "{{strategy.order.action}}",
+    "open_close": "OPEN",
+    "limit_price": "1.50",
+    "qty": 1,
+    "alert_id": "{{ticker}}-{{strategy.order.id}}-{{timenow}}"
+  },
+  "fixed_example": {
+    "passphrase": "REPLACE_WITH_WEBHOOK_PASSPHRASE",
+    "symbol": "AAPL261120C00250000",
+    "side": "BUY",
+    "open_close": "OPEN",
+    "limit_price": "1.50",
+    "qty": 1,
+    "alert_id": "aapl-call-2026-10-19-001"
+  }
+}
