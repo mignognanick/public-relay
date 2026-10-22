@@ -90,6 +90,17 @@ def _env_fallback(env: dict, key: str, default: LimitFallback) -> LimitFallback:
             raise ValueError(f"{key} must be ask, bid, or reject")
 
 
+def _env_stop_percent(env: dict, key: str) -> Optional[Decimal]:
+    """Empty disables the stop. A number is the percent below the entry, strictly between 0 and 100."""
+    text = _env_text(env, key)
+    if text == "":
+        return None
+    value = Decimal(text)
+    if value <= 0 or value >= 100:
+        raise ValueError(f"{key} must be between 0 and 100, or empty to disable")
+    return value
+
+
 @dataclass
 class Settings:
     public_secret: str = ""
@@ -114,6 +125,7 @@ class Settings:
     tp_percent: Decimal = Decimal("20")
     tp_fraction: Decimal = Decimal("0.50")
     tp_single: bool = False
+    stop_loss_percent: Optional[Decimal] = None  # empty = off
     exits_count_toward_order_cap: bool = False
     max_exit_orders_per_day: int = 6
 
@@ -133,6 +145,7 @@ class Settings:
             "tp_percent": format(self.tp_percent, "f"),
             "tp_fraction": format(self.tp_fraction, "f"),
             "tp_single": self.tp_single,
+            "stop_loss_percent": None if self.stop_loss_percent is None else format(self.stop_loss_percent, "f"),
             "exits_count_toward_order_cap": self.exits_count_toward_order_cap,
             "max_exit_orders_per_day": self.max_exit_orders_per_day,
             "enforce_hours": self.enforce_hours,
@@ -179,6 +192,7 @@ class Settings:
             tp_percent=tp_percent,
             tp_fraction=tp_fraction,
             tp_single=_env_bool(e, "TP_SINGLE", False),
+            stop_loss_percent=_env_stop_percent(e, "STOP_LOSS_PERCENT"),
             exits_count_toward_order_cap=_env_bool(e, "EXITS_COUNT_TOWARD_ORDER_CAP", False),
             max_exit_orders_per_day=_env_int(e, "MAX_EXIT_ORDERS_PER_DAY", 6, 1, 1000),
         )
@@ -271,20 +285,27 @@ class Store:
     async def record_open(self, underlying: str, strategy: str, mode: str, symbol: str, entry_side: str,
                           right_side: str, qty: int, strike: str, alert_id: str, qty_open: Optional[int] = None,
                           tp_qty: int = 0, tp_limit: Optional[str] = None, tp_order_id: Optional[str] = None,
-                          tp_status: str = "NONE", entry_limit: Optional[str] = None) -> Optional[str]:
+                          tp_status: str = "NONE", entry_limit: Optional[str] = None,
+                          tp_filled: int = 0, stop_qty: int = 0, stop_filled: int = 0,
+                          stop_limit: Optional[str] = None, stop_order_id: Optional[str] = None,
+                          stop_status: str = "NONE") -> Optional[str]:
         data = await self._rpc("relay_record_open", {
             "p_underlying": underlying, "p_strategy": strategy, "p_mode": mode, "p_symbol": symbol,
             "p_entry_side": entry_side, "p_right_side": right_side, "p_qty": qty, "p_strike": strike,
             "p_alert_id": alert_id, "p_qty_open": qty if qty_open is None else qty_open,
             "p_tp_qty": tp_qty, "p_tp_limit": tp_limit, "p_tp_order_id": tp_order_id,
-            "p_tp_status": tp_status, "p_entry_limit": entry_limit})
+            "p_tp_status": tp_status, "p_entry_limit": entry_limit, "p_tp_filled": tp_filled,
+            "p_stop_qty": stop_qty, "p_stop_filled": stop_filled, "p_stop_limit": stop_limit,
+            "p_stop_order_id": stop_order_id, "p_stop_status": stop_status})
         return _rpc_reason(data, "relay_record_open")
 
     async def record_close(self, underlying: str, strategy: str, mode: str, symbol: str,
-                           alert_id: str) -> Optional[str]:
+                           alert_id: str, tp_status: Optional[str] = None, stop_status: Optional[str] = None,
+                           tp_filled: Optional[int] = None, stop_filled: Optional[int] = None) -> Optional[str]:
         data = await self._rpc("relay_record_close", {
             "p_underlying": underlying, "p_strategy": strategy, "p_mode": mode,
-            "p_symbol": symbol, "p_alert_id": alert_id})
+            "p_symbol": symbol, "p_alert_id": alert_id, "p_tp_status": tp_status,
+            "p_stop_status": stop_status, "p_tp_filled": tp_filled, "p_stop_filled": stop_filled})
         return _rpc_reason(data, "relay_record_close")
 
     async def log_pick(self, alert_id: str, day: str, mode: str, selection: dict) -> None:
@@ -385,6 +406,10 @@ class PublicClient:
     async def place(self, body: dict) -> httpx.Response:
         acct = await self.account_id()
         return await self._req("POST", f"/userapigateway/trading/{acct}/order", body)
+
+    async def get_order(self, order_id: str) -> httpx.Response:
+        acct = await self.account_id()
+        return await self._req("GET", f"/userapigateway/trading/{acct}/order/{order_id}")
 
     async def _account(self, what: str) -> str:
         try:
@@ -781,6 +806,26 @@ def take_profit_limit(entry: Decimal, percent: Decimal) -> Decimal:
     return (entry * (Decimal(1) + percent / Decimal(100))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
+def stop_price(entry: Decimal, percent: Decimal) -> Decimal:
+    """Stop = entry * (1 - STOP_LOSS_PERCENT/100), rounded to the nearest tenth of a cent.
+
+    1.45 with 30 percent is 1.015. Public.com option ticks are often 0.01 or 0.05; a live
+    preflight may still reject a sub-penny price. This build only reports the order.
+    """
+    price = (entry * (Decimal(1) - percent / Decimal(100))).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+    if price <= 0:
+        raise Reject("stop price must be > 0")
+    return price
+
+
+def price_text(value: Decimal) -> str:
+    """At least two decimals, up to three, so 1.015 stays 1.015 and 1.020 is 1.02."""
+    text = f"{value.quantize(Decimal('0.001'), rounding=ROUND_HALF_UP):.3f}"
+    if text.endswith("0"):
+        text = text[:-1]
+    return text
+
+
 def no_take_profit_reason(qty: int, fraction: Decimal) -> str:
     if qty < 2:
         return "single contract closes on the flatten alert; set TP_SINGLE to take profit that contract"
@@ -789,31 +834,154 @@ def no_take_profit_reason(qty: int, fraction: Decimal) -> str:
     return "no take-profit quantity"
 
 
-def runner_qty(stored: dict) -> int:
-    if "qty_open" in stored and stored.get("qty_open") not in (None, ""):
-        return whole_qty(stored.get("qty_open"), allow_zero=True)
-    return whole_qty(stored.get("qty"))
-
-
-def stored_tp_qty(stored: dict) -> int:
-    if stored.get("tp_qty") in (None, ""):
+def _count_field(stored: dict, key: str) -> int:
+    raw = stored.get(key)
+    if raw in (None, ""):
         return 0
-    return whole_qty(stored.get("tp_qty"), allow_zero=True)
+    return whole_qty(raw, allow_zero=True)
 
 
-def cancel_take_profit_view(stored: dict) -> Optional[dict]:
-    """A resting take-profit is cancelled by a flatten. Those contracts are not sold."""
-    if str(stored.get("tp_status") or "").upper() != "RESTING":
+def clamp_fills(opened: int, tp_filled: int, stop_filled: int) -> tuple[int, int]:
+    """Fills are of one position. Cap them so a later sell cannot close more than was opened."""
+    tp_filled = min(max(tp_filled, 0), opened)
+    stop_filled = min(max(stop_filled, 0), opened - tp_filled)
+    return tp_filled, stop_filled
+
+
+def stored_exit(stored: dict, prefix: str) -> tuple[str, int, int]:
+    """Status, ordered quantity, and filled quantity for the take-profit or the stop."""
+    status = str(stored.get(f"{prefix}_status") or "NONE").upper()
+    ordered = _count_field(stored, f"{prefix}_qty")
+    filled = _count_field(stored, f"{prefix}_filled")
+    match status:
+        case "NONE":
+            return "NONE", 0, 0
+        case "RESTING":
+            return "RESTING", ordered, min(filled, ordered)
+        case "PARTIAL":
+            if ordered < 1 or filled <= 0 or filled >= ordered:
+                raise Reject(f"{prefix} partial fill needs a filled quantity below the order size", 502)
+            return "PARTIAL", ordered, filled
+        case "FILLED":
+            return "FILLED", ordered, ordered if filled == 0 else min(filled, ordered)
+        case "CANCELLED":
+            return "CANCELLED", ordered, min(filled, ordered)
+        case _:
+            raise Reject(f"unrecognized {prefix} status {status!r}", 502)
+
+
+def broker_fill(payload: dict, ordered: int) -> tuple[str, int]:
+    """Map a Public.com order payload to our status and a filled quantity that cannot exceed the order."""
+    status = str(payload.get("status") or "").upper()
+    raw = payload.get("filledQuantity")
+    filled = 0 if raw in (None, "") else whole_qty(raw, allow_zero=True)
+    filled = min(max(filled, 0), ordered)
+    match status:
+        case "FILLED":
+            return "FILLED", ordered if filled == 0 else filled
+        case "PARTIALLY_FILLED":
+            if filled <= 0:
+                raise Reject("partial fill is missing filledQuantity", 502)
+            if filled >= ordered:
+                return "FILLED", ordered
+            return "PARTIAL", filled
+        case "NEW" | "PENDING_REPLACE" | "PENDING_CANCEL":
+            return "RESTING", filled
+        case "CANCELLED" | "QUEUED_CANCELLED" | "EXPIRED" | "REJECTED" | "REPLACED":
+            if ordered > 0 and filled >= ordered:
+                return "FILLED", ordered
+            if filled > 0:
+                return "PARTIAL", filled
+            return "CANCELLED", 0
+        case _:
+            raise Reject(f"unrecognized order status {status!r}", 502)
+
+
+def reduced_stop_qty(opened: int, tp_filled: int, stop_ordered: int, stop_filled: int,
+                     stop_status: str) -> Optional[int]:
+    """After a take-profit fill, the stop may cover only the contracts still open."""
+    if stop_status not in ("RESTING", "PARTIAL") or tp_filled <= 0:
         return None
-    order_id = str(stored.get("tp_order_id") or "").strip()
-    if not order_id:
-        return None
+    working = max(0, stop_ordered - stop_filled)
+    still = max(0, opened - tp_filled - stop_filled)
+    reduced = min(working, still)
+    if reduced < working:
+        return reduced
+    return None
+
+
+def exit_plan(stored: dict) -> dict:
+    """What a flatten must cancel and how many contracts are still open.
+
+    A resting take-profit has not closed anything. Those contracts are sold with the runners.
+    A fill, including a partial fill, reduces the sell to what remains. Fills are clamped so
+    the sell cannot exceed the opened quantity.
+    """
+    opened = whole_qty(stored.get("qty"))
+    tp_status, tp_ordered, tp_filled = stored_exit(stored, "tp")
+    stop_status, stop_ordered, stop_filled = stored_exit(stored, "stop")
+    tp_filled, stop_filled = clamp_fills(opened, tp_filled, stop_filled)
+    still = opened - tp_filled - stop_filled
+    unfilled_tp = max(0, tp_ordered - tp_filled) if tp_status in ("RESTING", "PARTIAL") else 0
+    unfilled_stop = max(0, stop_ordered - stop_filled) if stop_status in ("RESTING", "PARTIAL") else 0
+    included_tp = min(unfilled_tp, still)
+    runners = still - included_tp
+    reduced = reduced_stop_qty(opened, tp_filled, stop_ordered, stop_filled, stop_status)
+    cancel_tp = None
+    if unfilled_tp > 0 and str(stored.get("tp_order_id") or "").strip():
+        cancel_tp = {
+            "orderId": str(stored.get("tp_order_id")).strip(),
+            "quantity": unfilled_tp,
+            "reason": "partial" if tp_filled else "unfilled",
+            "note": ("unfilled contracts are included in this sell-to-close" if included_tp
+                     else "cancelled so it cannot sell contracts that are already closed"),
+        }
+    cancel_stop = None
+    if unfilled_stop > 0 and str(stored.get("stop_order_id") or "").strip():
+        cancel_stop = {
+            "orderId": str(stored.get("stop_order_id")).strip(),
+            "quantity": unfilled_stop,
+            "reason": "flatten",
+            "note": "cancelled by flatten",
+        }
+        if reduced is not None:
+            cancel_stop["working_quantity"] = reduced
+            cancel_stop["note"] = "take-profit fills reduced the stop to the runners; flatten cancels it"
+    tp_after = "CANCELLED" if cancel_tp else tp_status
+    stop_after = "CANCELLED" if cancel_stop else stop_status
     return {
-        "orderId": order_id,
-        "quantity": stored_tp_qty(stored),
-        "reason": "unfilled",
-        "note": "cancelled take-profit contracts are not sold",
+        "opened_qty": opened,
+        "still_open": still,
+        "runners": runners,
+        "take_profit_contracts_closed": included_tp,
+        "tp_filled": tp_filled,
+        "stop_filled": stop_filled,
+        "tp_status_after": tp_after,
+        "stop_status_after": stop_after,
+        "cancel_take_profit": cancel_tp,
+        "cancel_stop": cancel_stop,
+        "stop_reduced_to": reduced,
+        "note": flatten_note(still, cancel_tp, cancel_stop, reduced),
     }
+
+
+def flatten_note(still: int, cancel_tp: Optional[dict], cancel_stop: Optional[dict],
+                 reduced: Optional[int]) -> str:
+    if still == 0:
+        if cancel_tp:
+            return ("Nothing remains open. The resting take-profit is cancelled so it cannot sell "
+                    "contracts that are already closed.")
+        if cancel_stop:
+            return "Nothing remains open. The resting stop is cancelled."
+        return "Nothing remains open, so no sell is sent."
+    sentences = []
+    if cancel_tp:
+        sentences.append("Resting take-profit is cancelled. Its unfilled contracts are included in this sell-to-close.")
+    if reduced is not None:
+        sentences.append("Take-profit fills reduced the stop to the remaining runners.")
+    if cancel_stop:
+        sentences.append("Resting stop is cancelled.")
+    return " ".join(sentences) if sentences else "Sell-to-close the contracts still open."
 
 
 async def public_json(client: "PublicClient", method: str, path: str, body: Optional[dict] = None,
@@ -1006,20 +1174,50 @@ async def build_open(payload: dict, underlying: str, strategy: str, client: "Pub
     return order_payload, selection
 
 
-async def build_close(payload: dict, underlying: str, strategy: str, client: "PublicClient",
-                      s: "Settings", stored: dict, intent: str) -> tuple[dict, dict]:
-    symbol = str(stored.get("symbol") or "").upper().replace(" ", "")
-    parsed = parse_occ(symbol)
-    if not parsed or parsed["underlying"] != underlying:
-        raise Reject(f"stored contract {symbol!r} does not match {underlying}", 502)
-    runners = runner_qty(stored)
-    opened = whole_qty(stored.get("qty"))
-    tp_qty = stored_tp_qty(stored)
-    strike = parse_decimal(stored.get("strike")) or parsed["strike"]
-    spot = alert_underlying_price(payload)
-    cancel = cancel_take_profit_view(stored)
-    if runners < 1:
-        # Nothing left to sell. Cancel the resting take-profit and do not quote or preflight.
+async def reconcile_exits(stored: dict, client: "PublicClient", s: "Settings") -> dict:
+    """In LIVE, overlay Public.com fill status onto the stored take-profit and stop.
+
+    PREFLIGHT never submitted those orders, so their ids are not queried. A 404 means the id
+    was never accepted at the broker; stored fills stay as they are. Any other failure refuses
+    the flatten rather than guessing a quantity.
+    """
+    snapshot = dict(stored)
+    if s.mode != "LIVE":
+        return snapshot
+    for prefix in ("tp", "stop"):
+        status = str(snapshot.get(f"{prefix}_status") or "NONE").upper()
+        order_id = str(snapshot.get(f"{prefix}_order_id") or "").strip()
+        if status not in ("RESTING", "PARTIAL", "FILLED") or not order_id:
+            continue
+        try:
+            response = await client.get_order(order_id)
+        except (httpx.HTTPError, RuntimeError) as exc:
+            jlog("exit_status_unreachable", kind=prefix, error=type(exc).__name__)
+            raise Reject("order status unreachable", 502) from exc
+        if response.status_code == 404:
+            jlog("exit_not_at_broker", kind=prefix, orderId=order_id)
+            continue
+        if response.status_code >= 400:
+            raise Reject(f"order status failed ({response.status_code})", 502)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise Reject("order status returned invalid JSON", 502) from exc
+        if not isinstance(payload, dict):
+            raise Reject("order status returned invalid JSON", 502)
+        ordered = _count_field(snapshot, f"{prefix}_qty")
+        new_status, filled = broker_fill(payload, ordered)
+        snapshot[f"{prefix}_status"] = new_status
+        snapshot[f"{prefix}_filled"] = filled
+        jlog("exit_reconciled", kind=prefix, orderId=order_id, status=new_status, filled=filled)
+    return snapshot
+
+
+def _close_selection(plan: dict, underlying: str, strategy: str, stored: dict, symbol: str,
+                     parsed: dict, strike: Decimal, spot: Optional[Decimal], intent: str,
+                     chosen: Optional[Leg], limit: Optional[Decimal], limit_source: Optional[str],
+                     legs: list[Leg]) -> dict:
+    if chosen is None or limit is None:
         selection = {
             "action": "close", "intent": intent, "underlying": underlying, "strategy": strategy,
             "entry_side": str(stored.get("entry_side") or ""), "order_side": "SELL", "open_close": "CLOSE",
@@ -1027,11 +1225,54 @@ async def build_close(payload: dict, underlying: str, strategy: str, client: "Pu
             "expiry": parsed["expiry"].isoformat(), "right": parsed["right"], "candidates": [],
             "chosen_symbol": symbol, "chosen_strike": dec_text(strike), "delta": None, "delta_source": None,
             "bid": None, "ask": None, "mid": None, "limit": None, "limit_source": None,
-            "qty": 0, "opened_qty": opened, "take_profit_qty": tp_qty, "runners_closed": 0,
-            "skip_order": True,
+            "qty": 0,
         }
-        if cancel is not None:
-            selection["cancel_take_profit"] = cancel
+    else:
+        selection = selection_from_leg(
+            "close", underlying, strategy, str(stored.get("entry_side") or ""), "SELL", "CLOSE",
+            spot, "alert" if spot is not None else None, parsed["expiry"], parsed["right"],
+            legs, chosen, limit, limit_source or "", plan["still_open"], intent)
+    selection.update({
+        "opened_qty": plan["opened_qty"],
+        "take_profit_qty": _count_field(stored, "tp_qty"),
+        "take_profit_filled": plan["tp_filled"],
+        "stop_qty": _count_field(stored, "stop_qty"),
+        "stop_filled": plan["stop_filled"],
+        "runners_closed": plan["runners"],
+        "contracts_closed": plan["still_open"],
+        "take_profit_contracts_closed": plan["take_profit_contracts_closed"],
+        "tp_status_after": plan["tp_status_after"],
+        "stop_status_after": plan["stop_status_after"],
+        "tp_filled": plan["tp_filled"],
+        "note": plan["note"],
+    })
+    if plan["still_open"] < 1:
+        selection["skip_order"] = True
+        selection["qty"] = 0
+    if plan["cancel_take_profit"] is not None:
+        selection["cancel_take_profit"] = plan["cancel_take_profit"]
+    if plan["cancel_stop"] is not None:
+        selection["cancel_stop"] = plan["cancel_stop"]
+    if plan["stop_reduced_to"] is not None:
+        selection["stop_reduced_to"] = plan["stop_reduced_to"]
+    return selection
+
+
+async def build_close(payload: dict, underlying: str, strategy: str, client: "PublicClient",
+                      s: "Settings", stored: dict, intent: str) -> tuple[dict, dict]:
+    symbol = str(stored.get("symbol") or "").upper().replace(" ", "")
+    parsed = parse_occ(symbol)
+    if not parsed or parsed["underlying"] != underlying:
+        raise Reject(f"stored contract {symbol!r} does not match {underlying}", 502)
+    snapshot = await reconcile_exits(stored, client, s)
+    plan = exit_plan(snapshot)
+    strike = parse_decimal(snapshot.get("strike")) or parsed["strike"]
+    spot = alert_underlying_price(payload)
+    if plan["still_open"] < 1:
+        selection = _close_selection(plan, underlying, strategy, snapshot, symbol, parsed, strike, spot,
+                                     intent, None, None, None, [])
+        jlog("flatten", alert_id=payload.get("alert_id"), contracts_closed=0, note=plan["note"],
+             cancel_take_profit=plan["cancel_take_profit"], cancel_stop=plan["cancel_stop"])
         return {"symbol": symbol, "side": "SELL", "open_close": "CLOSE", "qty": 0}, selection
     quoted = await client.quotes([{"symbol": symbol, "type": "OPTION"}], what="option quote")
     quote = first_quote(quoted, "option quote")
@@ -1050,17 +1291,13 @@ async def build_close(payload: dict, underlying: str, strategy: str, client: "Pu
     chosen = Leg(symbol, strike, delta, delta_source, bid, ask)
     order_payload = {
         "symbol": symbol, "side": "SELL", "open_close": "CLOSE",
-        "limit_price": cents(limit), "qty": runners,
+        "limit_price": cents(limit), "qty": plan["still_open"],
     }
-    selection = selection_from_leg(
-        "close", underlying, strategy, str(stored.get("entry_side") or ""), "SELL", "CLOSE",
-        spot, "alert" if spot is not None else None, parsed["expiry"], parsed["right"],
-        [chosen], chosen, limit, limit_source, runners, intent)
-    selection["opened_qty"] = opened
-    selection["take_profit_qty"] = tp_qty
-    selection["runners_closed"] = runners
-    if cancel is not None:
-        selection["cancel_take_profit"] = cancel
+    selection = _close_selection(plan, underlying, strategy, snapshot, symbol, parsed, strike, spot,
+                                 intent, chosen, limit, limit_source, [chosen])
+    jlog("flatten", alert_id=payload.get("alert_id"), contracts_closed=plan["still_open"],
+         runners_closed=plan["runners"], take_profit_contracts_closed=plan["take_profit_contracts_closed"],
+         cancel_take_profit=plan["cancel_take_profit"], cancel_stop=plan["cancel_stop"], note=plan["note"])
     return order_payload, selection
 
 
@@ -1099,27 +1336,34 @@ async def prepare_order(payload: dict, s: "Settings", client: "PublicClient", st
 
 
 async def book_position(store: "Store", selection: dict, order: dict, mode: str, alert_id: str,
-                        take_profit: Optional[dict] = None) -> Optional[str]:
+                        take_profit: Optional[dict] = None, stop: Optional[dict] = None) -> Optional[str]:
     action = selection.get("action")
     if action == "open":
         tp = take_profit or {}
+        held = stop or {}
         attached = bool(tp.get("attached"))
+        stop_on = bool(held.get("attached"))
         qty = int(order["qty"])
-        qty_open = int(tp["qty_open"]) if "qty_open" in tp else qty
+        entry_limit = cents(order["limit_price"]) if isinstance(order["limit_price"], Decimal) else str(order["limit_price"])
         return await store.record_open(
             str(selection["underlying"]), str(selection["strategy"]), mode, order["symbol"],
             str(selection["entry_side"]), str(selection["right"]), qty,
-            str(selection["chosen_strike"]), alert_id, qty_open=qty_open,
+            str(selection["chosen_strike"]), alert_id, qty_open=qty,
             tp_qty=int(tp.get("quantity") or 0) if attached else 0,
             tp_limit=tp.get("limit_price") if attached else None,
             tp_order_id=tp.get("orderId") if attached else None,
             tp_status="RESTING" if attached else "NONE",
-            entry_limit=cents(order["limit_price"]) if isinstance(order["limit_price"], Decimal)
-            else str(order["limit_price"]))
+            entry_limit=entry_limit, tp_filled=0,
+            stop_qty=int(held.get("quantity") or 0) if stop_on else 0,
+            stop_filled=0, stop_limit=held.get("stop_price") if stop_on else None,
+            stop_order_id=held.get("orderId") if stop_on else None,
+            stop_status="RESTING" if stop_on else "NONE")
     if action == "close":
         return await store.record_close(
             str(selection["underlying"]), str(selection["strategy"]), mode,
-            str(selection.get("chosen_symbol") or order["symbol"]), alert_id)
+            str(selection.get("chosen_symbol") or order["symbol"]), alert_id,
+            tp_status=selection.get("tp_status_after"), stop_status=selection.get("stop_status_after"),
+            tp_filled=selection.get("tp_filled"), stop_filled=selection.get("stop_filled"))
     return f"unhandled selection action {action!r}"
 
 
@@ -1141,7 +1385,8 @@ async def plan_take_profit(order: dict, s: "Settings", client: "PublicClient", s
     tp_qty = take_profit_qty(qty, s.tp_fraction, s.tp_single)
     if tp_qty < 1:
         reason = no_take_profit_reason(qty, s.tp_fraction)
-        report = {"attached": False, "quantity": 0, "qty_open": qty, "status": "NONE", "reason": reason}
+        report = {"attached": False, "quantity": 0, "qty_open": qty, "runners": qty,
+                  "status": "NONE", "reason": reason}
         jlog("take_profit", **report)
         return report, None
     limit = take_profit_limit(entry, s.tp_percent)
@@ -1151,14 +1396,14 @@ async def plan_take_profit(order: dict, s: "Settings", client: "PublicClient", s
     try:
         reason = await store.try_consume(day, s.mode, Decimal(0), False, s, is_exit=True)
     except (StoreError, httpx.HTTPError) as exc:
-        report = {"attached": False, "quantity": tp_qty, "qty_open": qty, "status": "NONE",
-                  "limit_price": cents(limit), "order": body,
+        report = {"attached": False, "quantity": tp_qty, "qty_open": qty, "runners": qty - tp_qty,
+                  "status": "NONE", "limit_price": cents(limit), "order": body,
                   "reason": f"state store unavailable: {type(exc).__name__}"}
         jlog("take_profit", **report)
         return report, None
     if reason:
-        report = {"attached": False, "quantity": tp_qty, "qty_open": qty, "status": "NONE",
-                  "limit_price": cents(limit), "order": body, "reason": reason}
+        report = {"attached": False, "quantity": tp_qty, "qty_open": qty, "runners": qty - tp_qty,
+                  "status": "NONE", "limit_price": cents(limit), "order": body, "reason": reason}
         jlog("take_profit", **report)
         return report, None
     slot = cap_slot(day, s.mode, Decimal(0), False, True, s.exits_count_toward_order_cap)
@@ -1167,24 +1412,24 @@ async def plan_take_profit(order: dict, s: "Settings", client: "PublicClient", s
         pf_body = _json(pf)
     except (httpx.HTTPError, RuntimeError, KeyError) as exc:
         await _release_quiet(store, slot)
-        report = {"attached": False, "quantity": tp_qty, "qty_open": qty, "status": "NONE",
-                  "limit_price": cents(limit), "order": body,
+        report = {"attached": False, "quantity": tp_qty, "qty_open": qty, "runners": qty - tp_qty,
+                  "status": "NONE", "limit_price": cents(limit), "order": body,
                   "reason": f"upstream error: {type(exc).__name__}"}
         jlog("take_profit", **report)
         return report, None
     jlog("take_profit", status=pf.status_code, request=body, response=pf_body, quantity=tp_qty)
     if pf.status_code >= 400:
         await _release_quiet(store, slot)
-        report = {"attached": False, "quantity": tp_qty, "qty_open": qty, "status": "NONE",
-                  "limit_price": cents(limit), "order": body, "reason": "preflight failed",
+        report = {"attached": False, "quantity": tp_qty, "qty_open": qty, "runners": qty - tp_qty,
+                  "status": "NONE", "limit_price": cents(limit), "order": body, "reason": "preflight failed",
                   "preflight_status": pf.status_code, "preflight": pf_body}
         return report, None
     report = {
-        "attached": True, "status": "RESTING", "quantity": tp_qty, "qty_open": qty - tp_qty,
-        "limit_price": cents(limit), "orderId": str(uuid.uuid4()), "order": body, "preflight": pf_body,
-        "note": "reported only; not sent to /order",
+        "attached": True, "status": "RESTING", "quantity": tp_qty, "qty_open": qty,
+        "runners": qty - tp_qty, "limit_price": cents(limit), "orderId": str(uuid.uuid4()),
+        "order": body, "preflight": pf_body, "note": "reported only; not sent to /order",
     }
-    jlog("take_profit", attached=True, quantity=tp_qty, qty_open=report["qty_open"],
+    jlog("take_profit", attached=True, quantity=tp_qty, qty_open=qty, runners=report["runners"],
          limit_price=report["limit_price"], orderId=report["orderId"], order=body)
     return report, slot
 
@@ -1193,7 +1438,78 @@ async def _release_quiet(store: "Store", slot: tuple) -> None:
     try:
         await store.release(*slot)
     except (StoreError, httpx.HTTPError):
-        jlog("release_failed", slot="take_profit")
+        jlog("release_failed", slot="exit")
+
+
+def stop_order_body(symbol: str, qty: int, price: Decimal) -> dict:
+    """STOP_LIMIT sell-to-close. Limit equals the stop so a wide 0DTE spread cannot sweep through."""
+    text = price_text(price)
+    return {
+        "instrument": {"symbol": symbol, "type": "OPTION"},
+        "orderSide": "SELL",
+        "orderType": "STOP_LIMIT",
+        "expiration": {"timeInForce": "DAY"},
+        "quantity": str(qty),
+        "stopPrice": text,
+        "limitPrice": text,
+        "openCloseIndicator": "CLOSE",
+    }
+
+
+async def plan_stop(order: dict, s: "Settings", client: "PublicClient", store: "Store",
+                    day: str) -> tuple[dict, Optional[tuple]]:
+    """Report a stop for every contract still open. Never calls place(). Does not use MAX_PREMIUM.
+
+    The stop covers the whole position, so it overlaps the take-profit until a fill reduces it
+    to the runners. Public.com's single-leg schema accepts STOP and STOP_LIMIT; STOP_LIMIT is
+    used so the protective sell has a price. If price gaps through the limit, the stop can sit
+    unfilled and the flatten alert is what closes the contracts.
+    """
+    qty = int(order["qty"])
+    if s.stop_loss_percent is None:
+        report = {"attached": False, "quantity": 0, "status": "NONE",
+                  "reason": "STOP_LOSS_PERCENT is not set"}
+        jlog("stop", **report)
+        return report, None
+    entry = order["limit_price"] if isinstance(order["limit_price"], Decimal) else Decimal(str(order["limit_price"]))
+    price = stop_price(entry, s.stop_loss_percent)
+    body = stop_order_body(order["symbol"], qty, price)
+    try:
+        reason = await store.try_consume(day, s.mode, Decimal(0), False, s, is_exit=True)
+    except (StoreError, httpx.HTTPError) as exc:
+        report = {"attached": False, "quantity": qty, "status": "NONE", "stop_price": price_text(price),
+                  "order": body, "reason": f"state store unavailable: {type(exc).__name__}"}
+        jlog("stop", **report)
+        return report, None
+    if reason:
+        report = {"attached": False, "quantity": qty, "status": "NONE", "stop_price": price_text(price),
+                  "order": body, "reason": reason}
+        jlog("stop", **report)
+        return report, None
+    slot = cap_slot(day, s.mode, Decimal(0), False, True, s.exits_count_toward_order_cap)
+    try:
+        pf = await client.preflight(body)
+        pf_body = _json(pf)
+    except (httpx.HTTPError, RuntimeError, KeyError) as exc:
+        await _release_quiet(store, slot)
+        report = {"attached": False, "quantity": qty, "status": "NONE", "stop_price": price_text(price),
+                  "order": body, "reason": f"upstream error: {type(exc).__name__}"}
+        jlog("stop", **report)
+        return report, None
+    jlog("stop", status=pf.status_code, request=body, response=pf_body, quantity=qty)
+    if pf.status_code >= 400:
+        await _release_quiet(store, slot)
+        report = {"attached": False, "quantity": qty, "status": "NONE", "stop_price": price_text(price),
+                  "order": body, "reason": "preflight failed", "preflight_status": pf.status_code,
+                  "preflight": pf_body}
+        return report, None
+    report = {
+        "attached": True, "status": "RESTING", "quantity": qty, "stop_price": price_text(price),
+        "limit_price": price_text(price), "orderId": str(uuid.uuid4()), "order": body,
+        "order_type": "STOP_LIMIT", "preflight": pf_body, "note": "reported only; not sent to /order",
+    }
+    jlog("stop", attached=True, quantity=qty, stop_price=report["stop_price"], orderId=report["orderId"], order=body)
+    return report, slot
 
 
 def audit_detail(selection: Optional[dict], **extra: Any) -> dict:
@@ -1302,24 +1618,27 @@ def create_app(settings: Optional[Settings] = None,
             if selection is not None and selection.get("skip_order"):
                 await store.log_pick(alert_id, day, s.mode, selection)
                 jlog("contract_pick", alert_id=alert_id, selection=selection)
-                jlog("flatten", alert_id=alert_id, runners_closed=0,
-                     cancel_take_profit=selection.get("cancel_take_profit"))
+                jlog("flatten_close", alert_id=alert_id, contracts_closed=0,
+                     cancel_take_profit=selection.get("cancel_take_profit"),
+                     cancel_stop=selection.get("cancel_stop"), note=selection.get("note"))
                 reason = await store.record_close(
                     str(selection["underlying"]), str(selection["strategy"]), s.mode,
-                    str(selection["chosen_symbol"]), alert_id)
+                    str(selection["chosen_symbol"]), alert_id,
+                    tp_status=selection.get("tp_status_after"), stop_status=selection.get("stop_status_after"),
+                    tp_filled=selection.get("tp_filled"), stop_filled=selection.get("stop_filled"))
                 if reason:
                     await store.finish(alert_id, "REJECTED", mode=s.mode,
                                        detail=audit_detail(selection, reason=reason))
                     return respond(409, error_body(alert_id, reason, selection))
-                note = ("No runner contracts remain. The resting take-profit is cancelled and its "
-                        "contracts are not sold." if selection.get("cancel_take_profit")
-                        else "No runner contracts remain, so no sell is sent.")
+                note = str(selection.get("note") or "Nothing remains open, so no sell is sent.")
                 await store.finish(alert_id, "ACCEPTED", "CLOSE", Decimal(0), s.mode,
-                                   audit_detail(selection, runners_closed=0, note=note))
+                                   audit_detail(selection, contracts_closed=0, note=note))
                 body = {"ok": True, "mode": s.mode, "alert_id": alert_id, "order_placed": False,
-                        "selection": selection, "runners_closed": 0, "note": note}
+                        "selection": selection, "contracts_closed": 0, "runners_closed": 0, "note": note}
                 if selection.get("cancel_take_profit"):
                     body["cancel_take_profit"] = selection["cancel_take_profit"]
+                if selection.get("cancel_stop"):
+                    body["cancel_stop"] = selection["cancel_stop"]
                 return respond(200, body)
             if selection is not None:
                 await store.log_pick(alert_id, day, s.mode, selection)
@@ -1349,11 +1668,11 @@ def create_app(settings: Optional[Settings] = None,
                 except (StoreError, httpx.HTTPError):
                     jlog("release_failed", alert_id=alert_id)  # fails safe: cap stays consumed
 
-        async def persist(take_profit: Optional[dict]) -> Optional[JSONResponse]:
+        async def persist(take_profit: Optional[dict], stop: Optional[dict] = None) -> Optional[JSONResponse]:
             if selection is None:
                 return None
             try:
-                reason = await book_position(store, selection, o, s.mode, alert_id, take_profit)
+                reason = await book_position(store, selection, o, s.mode, alert_id, take_profit, stop)
             except (StoreError, httpx.HTTPError) as exc:
                 jlog("position_persist_failed", alert_id=alert_id, error=type(exc).__name__)
                 if s.mode == "LIVE":
@@ -1368,30 +1687,42 @@ def create_app(settings: Optional[Settings] = None,
             await fail("REJECTED", audit_detail(selection, reason=reason))
             return respond(409, error_body(alert_id, reason, selection))
 
-        def accepted_body(preflight: Any, placed: bool, take_profit: Optional[dict] = None, **extra: Any) -> dict:
+        def accepted_body(preflight: Any, placed: bool, take_profit: Optional[dict] = None,
+                          stop: Optional[dict] = None, **extra: Any) -> dict:
             body = {"ok": True, "mode": s.mode, "alert_id": alert_id, "order_placed": placed, **extra}
             if preflight is not None:
                 body["preflight"] = preflight
             if selection is not None:
                 body["selection"] = selection
-                body["order"] = order_body(o)
+                if not selection.get("skip_order"):
+                    body["order"] = order_body(o)
             if selection is not None and selection.get("action") == "close":
+                body["contracts_closed"] = selection.get("contracts_closed")
                 body["runners_closed"] = selection.get("runners_closed")
+                body["take_profit_contracts_closed"] = selection.get("take_profit_contracts_closed")
                 if selection.get("cancel_take_profit"):
                     body["cancel_take_profit"] = selection["cancel_take_profit"]
-                    body["note"] = ("Resting take-profit is cancelled. Its contracts are not sold; "
-                                    "only the remaining runners are closed.")
+                if selection.get("cancel_stop"):
+                    body["cancel_stop"] = selection["cancel_stop"]
+                if selection.get("note"):
+                    body["note"] = selection["note"]
             if take_profit is not None:
                 body["take_profit"] = take_profit
+            if stop is not None:
+                body["stop"] = stop
             return body
 
         async def accept(preflight: Any, placed: bool, **extra: Any) -> JSONResponse:
             take_profit = None
+            stop = None
             if o["open_close"] == "OPEN":
                 take_profit, slot = await plan_take_profit(o, s, client, store, day)
                 if slot is not None:
                     releases.append(slot)
-            blocked = await persist(take_profit)
+                stop, stop_slot = await plan_stop(o, s, client, store, day)
+                if stop_slot is not None:
+                    releases.append(stop_slot)
+            blocked = await persist(take_profit, stop)
             if blocked is not None:
                 return blocked
             detail: dict[str, Any] = {}
@@ -1401,12 +1732,14 @@ def create_app(settings: Optional[Settings] = None,
                 detail["selection"] = selection
             if take_profit is not None:
                 detail["take_profit"] = take_profit
+            if stop is not None:
+                detail["stop"] = stop
             for key, value in extra.items():
                 if value is not None:
                     detail[key] = value
             await store.finish(alert_id, "ACCEPTED", o["open_close"], o["notional"], s.mode, detail or None)
             shown = None if placed else preflight
-            return respond(200, accepted_body(shown, placed, take_profit, **extra))
+            return respond(200, accepted_body(shown, placed, take_profit, stop, **extra))
 
         body = order_body(o)
         try:
