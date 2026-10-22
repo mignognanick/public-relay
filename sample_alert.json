@@ -1,5 +1,5 @@
 {
-  "_comment": "Paste ONE object below (without this wrapper) into the TradingView alert Message box. underlying_template lets FlowVWAP send the underlying; the relay selects the 0DTE contract. template/fixed_example still send a full OCC symbol.",
+  "_comment": "Paste ONE object below (without this wrapper) into the TradingView alert Message box. underlying_template lets FlowVWAP send the underlying; the relay selects the contract (0DTE unless EXPIRY_DAYS is set). qty comes from the strategy. Partial take-profit needs MAX_QTY >= 2 (default MAX_QTY is 1) or TP_SINGLE=true. template/fixed_example still send a full OCC symbol.",
   "underlying_template": {
     "passphrase": "REPLACE_WITH_WEBHOOK_PASSPHRASE",
     "symbol": "{{ticker}}",

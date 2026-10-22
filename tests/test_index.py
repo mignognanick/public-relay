@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from datetime import date, datetime
 from decimal import Decimal
@@ -49,7 +50,7 @@ class FakeSupabase:
 
     def __init__(self, fail=False, missing_position_rpc=False):
         self.alerts, self.counters, self.fail, self.calls = {}, {}, fail, []
-        self.positions, self.picks = {}, []
+        self.positions, self.picks, self.exit_orders = {}, [], {}
         self.missing_position_rpc = missing_position_rpc
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
@@ -65,8 +66,19 @@ class FakeSupabase:
             self.alerts[b["p_alert_id"]] = {"status": "RECEIVED"}
             return httpx.Response(200, json=True)
         if p == "/rest/v1/rpc/relay_try_consume":
-            c = self.counters.setdefault((b["p_day"], b["p_mode"]), [0, Decimal(0)])
+            key = (b["p_day"], b["p_mode"])
+            c = self.counters.setdefault(key, [0, Decimal(0)])
             n = Decimal(b["p_notional"])
+            if b.get("p_is_exit"):
+                used = self.exit_orders.get(key, 0)
+                if used >= int(b.get("p_max_exit_orders", 6)):
+                    return httpx.Response(200, json=f"MAX_EXIT_ORDERS_PER_DAY ({b.get('p_max_exit_orders', 6)}) reached")
+                if b.get("p_exit_counts") and c[0] >= b["p_max_orders"]:
+                    return httpx.Response(200, json=f"MAX_ORDERS_PER_DAY ({b['p_max_orders']}) reached")
+                self.exit_orders[key] = used + 1
+                if b.get("p_exit_counts"):
+                    c[0] += 1
+                return httpx.Response(200, json=None)
             if c[0] >= b["p_max_orders"]:
                 return httpx.Response(200, json=f"MAX_ORDERS_PER_DAY ({b['p_max_orders']}) reached")
             if b["p_is_open"] and c[1] + n > Decimal(b["p_max_opens"]):
@@ -75,7 +87,13 @@ class FakeSupabase:
             c[1] += n if b["p_is_open"] else 0
             return httpx.Response(200, json=None)
         if p == "/rest/v1/rpc/relay_release":
-            c = self.counters[(b["p_day"], b["p_mode"])]
+            key = (b["p_day"], b["p_mode"])
+            if b.get("p_is_exit"):
+                self.exit_orders[key] = self.exit_orders.get(key, 0) - 1
+                if b.get("p_exit_counts"):
+                    self.counters[key][0] -= 1
+                return httpx.Response(204)
+            c = self.counters[key]
             c[0] -= 1
             c[1] -= Decimal(b["p_notional"]) if b["p_is_open"] else 0
             return httpx.Response(204)
@@ -103,7 +121,11 @@ class FakeSupabase:
             self.positions[key] = {
                 "underlying": key[0], "strategy": key[1], "mode": key[2], "symbol": b["p_symbol"],
                 "entry_side": b["p_entry_side"], "right_side": b["p_right_side"], "qty": b["p_qty"],
-                "strike": b["p_strike"], "opened_alert_id": b["p_alert_id"], "status": "OPEN",
+                "qty_open": b.get("p_qty_open", b["p_qty"]), "strike": b["p_strike"],
+                "opened_alert_id": b["p_alert_id"], "status": "OPEN",
+                "tp_qty": b.get("p_tp_qty", 0), "tp_limit": b.get("p_tp_limit"),
+                "tp_order_id": b.get("p_tp_order_id"), "tp_status": b.get("p_tp_status", "NONE"),
+                "entry_limit": b.get("p_entry_limit"),
             }
             return httpx.Response(200, content=b"null", headers={"content-type": "application/json"})
         if p == "/rest/v1/rpc/relay_record_close":
@@ -113,6 +135,9 @@ class FakeSupabase:
                 return httpx.Response(200, json=f"no open position for {key[0]}/{key[1]}")
             row["status"] = "CLOSED"
             row["closed_alert_id"] = b["p_alert_id"]
+            row["qty_open"] = 0
+            if row.get("tp_status") == "RESTING":
+                row["tp_status"] = "CANCELLED"
             return httpx.Response(200, content=b"null", headers={"content-type": "application/json"})
         if p == "/rest/v1/contract_picks" and req.method == "POST":
             self.picks.append(b)
@@ -175,7 +200,8 @@ def test_preflight_mode_never_calls_order(tmp_path):
     assert r.status_code == 200, r.text
     assert r.json()["order_placed"] is False
     assert "selection" not in r.json()
-    assert any(p.endswith("/preflight/single-leg") for p in fake.paths())
+    assert r.json()["take_profit"]["attached"] is False and r.json()["take_profit"]["quantity"] == 0
+    assert len(ending(fake, "/preflight/single-leg")) == 1
     assert not any(p.endswith("/order") for p in fake.paths())
 
 
@@ -218,10 +244,11 @@ def test_daily_caps(tmp_path):
     assert c.post("/webhook", json=alert(alert_id="2", limit_price="1.50")).status_code == 200  # $300
     r = c.post("/webhook", json=alert(alert_id="3", limit_price="0.10"))
     assert r.status_code == 422 and "spend cap" in r.json()["error"]
-    # CLOSE still allowed by spend cap; then order-count cap (3) hits
+    # Closes are exits. They stay inside the spend rule and do not consume the entry order cap.
     assert c.post("/webhook", json=alert(alert_id="4", side="SELL", open_close="CLOSE")).status_code == 200
-    r = c.post("/webhook", json=alert(alert_id="5", side="SELL", open_close="CLOSE"))
-    assert r.status_code == 422 and "MAX_ORDERS_PER_DAY" in r.json()["error"]
+    assert c.post("/webhook", json=alert(alert_id="5", side="SELL", open_close="CLOSE")).status_code == 200
+    assert c.sb.counters[("2026-10-19", "PREFLIGHT")][0] == 2
+    assert c.sb.exit_orders[("2026-10-19", "PREFLIGHT")] == 2
 
 
 def test_secrets_not_logged(tmp_path, capsys):
@@ -307,9 +334,9 @@ CHOSEN_CALL = "SPY261019C00579000"
 CHOSEN_PUT = "SPY261019P00581000"
 
 
-def occ(strike, right, underlying="SPY"):
+def occ(strike, right, underlying="SPY", yymmdd="261019"):
     millis = int(Decimal(strike) * 1000)
-    return f"{underlying}261019{right}{millis:08d}"
+    return f"{underlying}{yymmdd}{right}{millis:08d}"
 
 
 def chain_row(symbol, strike, delta, bid, ask):
@@ -322,16 +349,18 @@ def chain_row(symbol, strike, delta, bid, ask):
     }
 
 
-def spy_chain(call_delta=None, put_delta=None, calls=CALLS, puts=PUTS):
+def spy_chain(call_delta=None, put_delta=None, calls=CALLS, puts=PUTS, yymmdd="261019"):
     return {
         "baseSymbol": "SPY",
-        "calls": [chain_row(occ(s, "C"), s, call_delta if call_delta is not None else d, b, a) for s, d, b, a in calls],
-        "puts": [chain_row(occ(s, "P"), s, put_delta if put_delta is not None else d, b, a) for s, d, b, a in puts],
+        "calls": [chain_row(occ(s, "C", yymmdd=yymmdd), s, call_delta if call_delta is not None else d, b, a)
+                  for s, d, b, a in calls],
+        "puts": [chain_row(occ(s, "P", yymmdd=yymmdd), s, put_delta if put_delta is not None else d, b, a)
+                 for s, d, b, a in puts],
     }
 
 
-def greek_map(rows, right):
-    return {occ(strike, right): delta for strike, delta, _bid, _ask in rows}
+def greek_map(rows, right, yymmdd="261019"):
+    return {occ(strike, right, yymmdd=yymmdd): delta for strike, delta, _bid, _ask in rows}
 
 
 class ChainPublic(FakePublic):
@@ -672,10 +701,306 @@ def test_underlying_preflight_failure_releases_and_does_not_store_position(tmp_p
     assert not ending(fake, "/order")
 
 
-def test_underlying_pick_does_not_log_passphrase(tmp_path, capsys):
-    c, fake = make(tmp_path, public=ChainPublic())
-    r = c.post("/webhook", json=underlying())
-    assert r.status_code == 200
-    blob = r.text + capsys.readouterr().out + json.dumps(c.sb.picks) + json.dumps(c.sb.alerts)
+def test_underlying_pick_does_not_log_passphrase(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="relay")
+    c, fake = make(tmp_path, public=ChainPublic(), MAX_QTY="2", MAX_DAILY_OPENS="1000")
+    r = c.post("/webhook", json=underlying(qty=2))
+    assert r.status_code == 200, r.text
+    assert r.json()["take_profit"]["attached"] is True
+    blob = r.text + caplog.text + json.dumps(c.sb.picks) + json.dumps(c.sb.alerts)
     assert PASS not in blob and SECRET not in blob
+    assert '"event": "take_profit"' in caplog.text
     assert not ending(fake, "/order")
+
+
+def test_settings_defaults_overrides_and_live_gate():
+    defaults = relay.Settings.from_env({})
+    assert defaults.mode == "PREFLIGHT"
+    assert defaults.delta_band_min == Decimal("0.50") and defaults.delta_band_max == Decimal("0.60")
+    assert defaults.itm_points == Decimal("5") and defaults.expiry_days == 0
+    assert defaults.open_limit_fallback == "ask" and defaults.close_limit_fallback == "bid"
+    assert defaults.max_orders_per_day == 3 and defaults.max_daily_opens == Decimal("300")
+    assert defaults.max_premium == Decimal("2.00")
+    assert defaults.tp_percent == Decimal("20") and defaults.tp_fraction == Decimal("0.50")
+    assert defaults.tp_single is False and defaults.exits_count_toward_order_cap is False
+    assert defaults.max_exit_orders_per_day == 6
+    blank = relay.Settings.from_env({"TP_PERCENT": "  ", "EXPIRY_DAYS": "", "ITM_POINTS": ""})
+    assert blank.tp_percent == Decimal("20") and blank.expiry_days == 0 and blank.itm_points == Decimal("5")
+    over = relay.Settings.from_env({
+        "DELTA_BAND_MIN": "0.40", "DELTA_BAND_MAX": "0.70", "ITM_POINTS": "2", "EXPIRY_DAYS": "2",
+        "OPEN_LIMIT_FALLBACK": "bid", "CLOSE_LIMIT_FALLBACK": "reject", "TP_PERCENT": "15",
+        "TP_FRACTION": "0.25", "TP_SINGLE": "true", "MAX_EXIT_ORDERS_PER_DAY": "4",
+        "EXITS_COUNT_TOWARD_ORDER_CAP": "yes", "MAX_ORDERS_PER_DAY": "5", "MAX_PREMIUM": "3.00",
+        "MAX_DAILY_OPENS": "900",
+    })
+    assert over.delta_band_min == Decimal("0.40") and over.expiry_days == 2
+    assert over.open_limit_fallback == "bid" and over.close_limit_fallback == "reject"
+    assert over.tp_single is True and over.exits_count_toward_order_cap is True
+    assert over.max_exit_orders_per_day == 4 and over.max_orders_per_day == 5
+    assert relay.Settings.from_env({"MODE": "LIVE"}).mode == "PREFLIGHT"
+    assert relay.Settings.from_env({"MODE": "LIVE", "LIVE_CONFIRM": "I_UNDERSTAND"}).mode == "LIVE"
+    with pytest.raises(ValueError):
+        relay.Settings.from_env({"DELTA_BAND_MIN": "0.80", "DELTA_BAND_MAX": "0.20"})
+    with pytest.raises(ValueError):
+        relay.Settings.from_env({"EXPIRY_DAYS": "31"})
+    with pytest.raises(ValueError):
+        relay.Settings.from_env({"OPEN_LIMIT_FALLBACK": "mid"})
+    assert relay.take_profit_qty(1, Decimal("0.50"), False) == 0
+    assert relay.take_profit_qty(1, Decimal("0.50"), True) == 1
+    assert relay.take_profit_qty(2, Decimal("0.50"), False) == 1
+    assert relay.take_profit_qty(3, Decimal("0.50"), False) == 1
+    assert relay.take_profit_qty(4, Decimal("0.50"), False) == 2
+    assert relay.take_profit_qty(2, Decimal("0.10"), False) == 1
+    assert relay.take_profit_qty(4, Decimal("0"), False) == 0
+    assert relay.take_profit_limit(Decimal("1.45"), Decimal("20")) == Decimal("1.74")
+    assert relay.take_profit_limit(Decimal("1.90"), Decimal("20")) == Decimal("2.28")
+    with pytest.raises(relay.Reject):
+        relay.limit_from_market(None, Decimal("1.37"), "reject")
+    assert relay.limit_from_market(Decimal("1.11"), None, "bid") == (Decimal("1.11"), "bid")
+
+
+def test_health_lists_tunables(tmp_path):
+    c, _ = make(tmp_path, DELTA_BAND_MIN="0.42", TP_PERCENT="15", EXPIRY_DAYS="3")
+    settings = c.get("/health").json()["settings"]
+    assert settings["delta_band_min"] == "0.42" and settings["delta_band_max"] == "0.60"
+    assert settings["itm_points"] == "5" and settings["expiry_days"] == 3
+    assert settings["tp_percent"] == "15" and settings["tp_fraction"] == "0.50"
+    assert settings["tp_single"] is False and settings["exits_count_toward_order_cap"] is False
+    assert settings["max_orders_per_day"] == 3 and settings["max_daily_opens"] == "300"
+    assert settings["max_premium"] == "2.00" and settings["max_exit_orders_per_day"] == 6
+    assert settings["open_limit_fallback"] == "ask" and settings["close_limit_fallback"] == "bid"
+    assert PASS not in json.dumps(settings) and "secret" not in json.dumps(settings)
+
+
+def test_env_changes_band_window_expiry_and_fallback(tmp_path):
+    band = ChainPublic()
+    c, fake = make(tmp_path, public=band, DELTA_BAND_MIN="0.75", DELTA_BAND_MAX="0.85")
+    body = c.post("/webhook", json=underlying(alert_id="band")).json()
+    assert body["selection"]["chosen_strike"] == "575"
+    assert Decimal(body["selection"]["delta"]) == Decimal("0.80")
+    assert not ending(fake, "/order")
+
+    narrow = ChainPublic()
+    c_itm, _ = make(tmp_path / "itm", public=narrow, ITM_POINTS="1")
+    selected = c_itm.post("/webhook", json=underlying(alert_id="itm")).json()["selection"]
+    assert {row["strike"] for row in selected["candidates"]} == {"579", "580"}
+    assert selected["chosen_symbol"] == CHOSEN_CALL
+
+    yymmdd = "261021"
+    chain = spy_chain(yymmdd=yymmdd)
+    greeks = greek_map(CALLS, "C", yymmdd) | greek_map(PUTS, "P", yymmdd)
+    c_exp, fake_exp = make(tmp_path / "exp", public=ChainPublic(chain=chain, greeks=greeks), EXPIRY_DAYS="2")
+    opened = c_exp.post("/webhook", json=underlying(alert_id="exp")).json()
+    assert opened["selection"]["expiry"] == "2026-10-21"
+    assert opened["selection"]["chosen_symbol"] == "SPY261021C00579000"
+    requested = json.loads(ending(fake_exp, "/option-chain")[0].content)
+    assert requested["expirationDate"] == "2026-10-21"
+
+    calls = [("579", "0.55", "1.11", None), ("580", "0.40", "0.20", "0.30")]
+    c_bid, _ = make(tmp_path / "bid", OPEN_LIMIT_FALLBACK="bid",
+                    public=ChainPublic(chain=spy_chain(calls=calls, puts=[]), greeks=greek_map(calls, "C")))
+    priced = c_bid.post("/webhook", json=underlying(alert_id="bid-open")).json()
+    assert priced["selection"]["limit"] == "1.11" and priced["selection"]["limit_source"] == "bid"
+
+    c_no, fake_no = make(tmp_path / "reject", OPEN_LIMIT_FALLBACK="reject",
+                         public=ChainPublic(chain=spy_chain(calls=calls, puts=[]), greeks=greek_map(calls, "C")))
+    rejected = c_no.post("/webhook", json=underlying(alert_id="no-mid"))
+    assert rejected.status_code == 422 and "no mid" in rejected.json()["error"]
+    assert not c_no.sb.positions and not ending(fake_no, "/preflight/single-leg")
+
+    c_ask, _ = make(tmp_path / "ask-close", public=ChainPublic(
+        quotes={CHOSEN_CALL: option_quote(CHOSEN_CALL, None, "0.95")}), CLOSE_LIMIT_FALLBACK="ask")
+    assert c_ask.post("/webhook", json=underlying(alert_id="to-close")).status_code == 200
+    closed = c_ask.post("/webhook", json=underlying(
+        alert_id="ask-close", side="sell", open_close="CLOSE", market_position=None, prev_market_position=None))
+    assert closed.status_code == 200, closed.text
+    assert closed.json()["selection"]["limit_source"] == "ask" and closed.json()["selection"]["limit"] == "0.95"
+
+
+def test_partial_take_profit_and_runner_flatten(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="relay")
+    quote = {CHOSEN_CALL: option_quote(CHOSEN_CALL, "1.10", "1.30", "0.10")}
+    c, fake = make(tmp_path, public=ChainPublic(quotes=quote), MAX_QTY="4", MAX_DAILY_OPENS="1000",
+                   MAX_ORDERS_PER_DAY="10")
+    opened = c.post("/webhook", json=underlying(qty=4, alert_id="open4"))
+    assert opened.status_code == 200, opened.text
+    body = opened.json()
+    tp = body["take_profit"]
+    assert tp["attached"] is True and tp["status"] == "RESTING"
+    assert tp["quantity"] == 2 and tp["qty_open"] == 2 and tp["limit_price"] == "1.74"
+    assert tp["order"]["orderSide"] == "SELL" and tp["order"]["openCloseIndicator"] == "CLOSE"
+    assert tp["order"]["quantity"] == "2" and tp["order"]["limitPrice"] == "1.74"
+    assert "orderId" not in tp["order"] and tp["orderId"]
+    assert body["order_placed"] is False and not ending(fake, "/order")
+    preflights = ending(fake, "/preflight/single-leg")
+    assert len(preflights) == 2
+    assert json.loads(preflights[0].content)["openCloseIndicator"] == "OPEN"
+    tp_request = json.loads(preflights[1].content)
+    assert tp_request["limitPrice"] == "1.74" and "orderId" not in tp_request
+    pos = c.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]
+    assert pos["qty"] == 4 and pos["qty_open"] == 2 and pos["tp_qty"] == 2
+    assert pos["tp_status"] == "RESTING" and pos["tp_order_id"] == tp["orderId"]
+    assert pos["entry_limit"] == "1.45" and pos["tp_limit"] == "1.74"
+    assert '"event": "take_profit"' in caplog.text and '"limitPrice": "1.74"' in caplog.text
+    assert PASS not in opened.text and PASS not in caplog.text
+
+    flat = c.post("/webhook", json=underlying(
+        qty=99, side="sell", market_position="flat", prev_market_position="long", alert_id="flat4"))
+    assert flat.status_code == 200, flat.text
+    closed = flat.json()
+    assert closed["runners_closed"] == 2
+    assert closed["order"]["quantity"] == "2" and closed["order"]["openCloseIndicator"] == "CLOSE"
+    assert closed["cancel_take_profit"]["orderId"] == tp["orderId"]
+    assert closed["cancel_take_profit"]["quantity"] == 2
+    assert "not sold" in closed["cancel_take_profit"]["note"]
+    assert "not sold" in closed["note"]
+    saved = c.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]
+    assert saved["status"] == "CLOSED" and saved["tp_status"] == "CANCELLED" and saved["qty_open"] == 0
+    assert len(ending(fake, "/preflight/single-leg")) == 3
+    assert not ending(fake, "/order")
+
+
+def test_take_profit_fraction_and_single_contract(tmp_path):
+    c, fake = make(tmp_path, public=ChainPublic(), MAX_QTY="4", MAX_DAILY_OPENS="5000")
+    three = c.post("/webhook", json=underlying(qty=3, alert_id="q3", strategy="Q3"))
+    assert three.status_code == 200, three.text
+    assert three.json()["take_profit"]["quantity"] == 1 and three.json()["take_profit"]["qty_open"] == 2
+    two = c.post("/webhook", json=underlying(qty=2, alert_id="q2", strategy="Q2"))
+    assert two.json()["take_profit"]["quantity"] == 1 and two.json()["take_profit"]["qty_open"] == 1
+    one = c.post("/webhook", json=underlying(qty=1, alert_id="q1", strategy="Q1"))
+    assert one.json()["take_profit"]["attached"] is False and one.json()["take_profit"]["quantity"] == 0
+    assert c.sb.positions[("SPY", "Q1", "PREFLIGHT")]["qty_open"] == 1
+    assert c.sb.positions[("SPY", "Q1", "PREFLIGHT")]["tp_status"] == "NONE"
+    # One preflight per single-contract open; the two larger opens each add a take-profit preflight.
+    assert len(ending(fake, "/preflight/single-leg")) == 5
+    assert not ending(fake, "/order")
+
+
+def test_tp_single_flatten_only_cancels(tmp_path):
+    c, fake = make(tmp_path, public=ChainPublic(), TP_SINGLE="true")
+    opened = c.post("/webhook", json=underlying(alert_id="one"))
+    assert opened.status_code == 200, opened.text
+    tp = opened.json()["take_profit"]
+    assert tp["attached"] is True and tp["quantity"] == 1 and tp["qty_open"] == 0
+    assert len(ending(fake, "/preflight/single-leg")) == 2
+    flat = c.post("/webhook", json=underlying(
+        side="sell", market_position="flat", prev_market_position="long", alert_id="flat-one", qty=99))
+    assert flat.status_code == 200, flat.text
+    body = flat.json()
+    assert body["runners_closed"] == 0 and body["order_placed"] is False and "order" not in body
+    assert body["cancel_take_profit"]["orderId"] == tp["orderId"]
+    assert body["cancel_take_profit"]["quantity"] == 1
+    assert "not sold" in body["note"] and "not sold" in body["cancel_take_profit"]["note"]
+    assert len(ending(fake, "/preflight/single-leg")) == 2
+    assert ending(fake, "/quotes") == []
+    assert not ending(fake, "/order")
+    saved = c.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]
+    assert saved["status"] == "CLOSED" and saved["tp_status"] == "CANCELLED" and saved["qty_open"] == 0
+
+
+def test_exits_do_not_consume_the_entry_cap(tmp_path):
+    c, fake = make(tmp_path, MAX_QTY="2", MAX_DAILY_OPENS="1000")
+    for i in range(3):
+        r = c.post("/webhook", json=alert(alert_id=f"o{i}", qty=2, limit_price="1.00"))
+        assert r.status_code == 200, r.text
+        tp = r.json()["take_profit"]
+        assert tp["attached"] is True and tp["quantity"] == 1 and tp["limit_price"] == "1.20"
+        assert "orderId" not in tp["order"] and tp["order"]["openCloseIndicator"] == "CLOSE"
+    assert c.sb.counters[("2026-10-19", "PREFLIGHT")][0] == 3
+    assert c.sb.exit_orders[("2026-10-19", "PREFLIGHT")] == 3
+    blocked = c.post("/webhook", json=alert(alert_id="o4", qty=2, limit_price="1.00"))
+    assert blocked.status_code == 422 and "MAX_ORDERS_PER_DAY" in blocked.json()["error"]
+    closed = c.post("/webhook", json=alert(alert_id="c1", side="SELL", open_close="CLOSE", qty=1))
+    assert closed.status_code == 200, closed.text
+    assert c.sb.counters[("2026-10-19", "PREFLIGHT")][0] == 3
+    assert c.sb.exit_orders[("2026-10-19", "PREFLIGHT")] == 4
+    assert not ending(fake, "/order")
+    assert ("AAPL", "default", "PREFLIGHT") not in c.sb.positions
+
+
+def test_exits_can_count_toward_the_order_cap(tmp_path):
+    c, _ = make(tmp_path, EXITS_COUNT_TOWARD_ORDER_CAP="true")
+    assert c.post("/webhook", json=alert(alert_id="1", limit_price="1.50")).status_code == 200
+    assert c.post("/webhook", json=alert(alert_id="2", limit_price="1.50")).status_code == 200
+    assert c.post("/webhook", json=alert(alert_id="4", side="SELL", open_close="CLOSE")).status_code == 200
+    blocked = c.post("/webhook", json=alert(alert_id="5", side="SELL", open_close="CLOSE"))
+    assert blocked.status_code == 422 and "MAX_ORDERS_PER_DAY" in blocked.json()["error"]
+    assert c.sb.counters[("2026-10-19", "PREFLIGHT")][0] == 3
+    assert c.sb.exit_orders[("2026-10-19", "PREFLIGHT")] == 1
+
+
+def test_exit_cap_skips_take_profit_and_keeps_the_entry(tmp_path):
+    c, fake = make(tmp_path, public=ChainPublic(), MAX_QTY="2", MAX_DAILY_OPENS="2000",
+                   MAX_EXIT_ORDERS_PER_DAY="2", MAX_ORDERS_PER_DAY="10")
+    for name in ("A", "B", "C"):
+        r = c.post("/webhook", json=underlying(alert_id=name, strategy=name, qty=2))
+        assert r.status_code == 200, r.text
+        if name == "C":
+            tp = r.json()["take_profit"]
+    assert c.sb.positions[("SPY", "A", "PREFLIGHT")]["tp_status"] == "RESTING"
+    assert c.sb.positions[("SPY", "A", "PREFLIGHT")]["qty_open"] == 1
+    assert tp["attached"] is False and tp["quantity"] == 1
+    assert "MAX_EXIT_ORDERS_PER_DAY" in tp["reason"]
+    assert "order" in tp  # the sell that was not sent
+    saved = c.sb.positions[("SPY", "C", "PREFLIGHT")]
+    assert saved["status"] == "OPEN" and saved["qty"] == 2 and saved["qty_open"] == 2
+    assert saved["tp_status"] == "NONE" and saved["tp_qty"] == 0
+    assert c.sb.exit_orders[("2026-10-19", "PREFLIGHT")] == 2
+    assert c.sb.counters[("2026-10-19", "PREFLIGHT")][0] == 3
+    assert not ending(fake, "/order")
+
+
+def test_take_profit_preflight_failure_keeps_the_entry(tmp_path):
+    class TpFails(ChainPublic):
+        def __init__(self):
+            super().__init__()
+            self.preflights = 0
+
+        def __call__(self, req):
+            if req.url.path.endswith("/preflight/single-leg"):
+                self.calls.append(req)
+                self.preflights += 1
+                if self.preflights >= 2:
+                    return httpx.Response(400, json={"error": "tp nope"})
+                return httpx.Response(200, json={"estimatedCost": "ok"})
+            return super().__call__(req)
+
+    c, fake = make(tmp_path, public=TpFails(), MAX_QTY="2", MAX_DAILY_OPENS="1000")
+    r = c.post("/webhook", json=underlying(qty=2, alert_id="tp-fail"))
+    assert r.status_code == 200, r.text
+    tp = r.json()["take_profit"]
+    assert tp["attached"] is False and tp["reason"] == "preflight failed" and tp["preflight_status"] == 400
+    pos = c.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]
+    assert pos["status"] == "OPEN" and pos["qty"] == 2 and pos["qty_open"] == 2 and pos["tp_status"] == "NONE"
+    assert c.sb.exit_orders.get(("2026-10-19", "PREFLIGHT"), 0) == 0
+    assert c.sb.counters[("2026-10-19", "PREFLIGHT")][0] == 1
+    assert not ending(fake, "/order")
+
+
+def test_take_profit_limit_may_exceed_max_premium(tmp_path):
+    calls = [("579", "0.55", "1.80", "2.00")]
+    c, fake = make(tmp_path, MAX_QTY="2", MAX_DAILY_OPENS="1000", MAX_PREMIUM="2.00",
+                   public=ChainPublic(chain=spy_chain(calls=calls, puts=[]), greeks=greek_map(calls, "C")))
+    r = c.post("/webhook", json=underlying(qty=2, alert_id="rich-tp"))
+    assert r.status_code == 200, r.text
+    assert r.json()["selection"]["limit"] == "1.90"
+    tp = r.json()["take_profit"]
+    assert tp["attached"] is True and tp["limit_price"] == "2.28"
+    assert json.loads(ending(fake, "/preflight/single-leg")[1].content)["limitPrice"] == "2.28"
+    assert not ending(fake, "/order")
+
+
+def test_live_open_does_not_place_the_take_profit(tmp_path):
+    c, fake = make(tmp_path, mode="LIVE", confirm="I_UNDERSTAND", MAX_QTY="2")
+    r = c.post("/webhook", json=alert(qty=2, limit_price="1.00"))
+    assert r.status_code == 200, r.text
+    assert r.json()["order_placed"] is True
+    assert r.json()["take_profit"]["attached"] is True
+    orders = ending(fake, "/order")
+    assert len(orders) == 1
+    assert len(ending(fake, "/preflight/single-leg")) == 2
+    entry_id = json.loads(orders[0].content)["orderId"]
+    assert r.json()["orderId"] == entry_id
+    assert r.json()["take_profit"]["orderId"] != entry_id
+    assert "orderId" not in r.json()["take_profit"]["order"]
+    assert "orderId" not in json.loads(ending(fake, "/preflight/single-leg")[1].content)
