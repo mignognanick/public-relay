@@ -105,7 +105,8 @@ class FakeSupabase:
             return httpx.Response(204)
         if self.missing_position_rpc and (
             p in ("/rest/v1/rpc/relay_get_position", "/rest/v1/rpc/relay_record_open",
-                  "/rest/v1/rpc/relay_record_close", "/rest/v1/contract_picks")
+                  "/rest/v1/rpc/relay_record_close", "/rest/v1/rpc/relay_list_open_positions",
+                  "/rest/v1/rpc/relay_save_paper", "/rest/v1/contract_picks")
         ):
             return httpx.Response(404, json={"message": "missing"})
         if p == "/rest/v1/rpc/relay_get_position":
@@ -129,6 +130,10 @@ class FakeSupabase:
                 "stop_qty": b.get("p_stop_qty", 0), "stop_filled": b.get("p_stop_filled", 0),
                 "stop_limit": b.get("p_stop_limit"), "stop_order_id": b.get("p_stop_order_id"),
                 "stop_status": b.get("p_stop_status", "NONE"),
+                "entry_order_id": b.get("p_entry_order_id"),
+                "entry_status": b.get("p_entry_status", "NONE"),
+                "entry_filled": b.get("p_entry_filled", 0),
+                "exits_placed": b.get("p_exits_placed") is True,
             }
             return httpx.Response(200, content=b"null", headers={"content-type": "application/json"})
         if p == "/rest/v1/rpc/relay_record_close":
@@ -152,21 +157,127 @@ class FakeSupabase:
             if b.get("p_stop_filled") is not None:
                 row["stop_filled"] = b["p_stop_filled"]
             return httpx.Response(200, content=b"null", headers={"content-type": "application/json"})
+        if p == "/rest/v1/rpc/relay_list_open_positions":
+            rows = [row for row in self.positions.values()
+                    if row["status"] == "OPEN" and row["mode"] == b["p_mode"]]
+            return httpx.Response(200, json=rows)
+        if p == "/rest/v1/rpc/relay_save_paper":
+            key = (b["p_underlying"], b["p_strategy"], b["p_mode"])
+            row = self.positions.get(key)
+            if not row or row["status"] != "OPEN":
+                return httpx.Response(200, json=f"no open position for {key[0]}/{key[1]}")
+            row.update({
+                "entry_order_id": b.get("p_entry_order_id"),
+                "entry_status": b.get("p_entry_status") or row.get("entry_status") or "NONE",
+                "entry_filled": 0 if b.get("p_entry_filled") in (None, "") else b.get("p_entry_filled"),
+                "tp_qty": b.get("p_tp_qty") or 0,
+                "tp_filled": 0 if b.get("p_tp_filled") in (None, "") else b.get("p_tp_filled"),
+                "tp_limit": b.get("p_tp_limit"),
+                "tp_order_id": b.get("p_tp_order_id"),
+                "tp_status": b.get("p_tp_status") or "NONE",
+                "stop_qty": b.get("p_stop_qty") or 0,
+                "stop_filled": 0 if b.get("p_stop_filled") in (None, "") else b.get("p_stop_filled"),
+                "stop_limit": b.get("p_stop_limit"),
+                "stop_order_id": b.get("p_stop_order_id"),
+                "stop_status": b.get("p_stop_status") or "NONE",
+                "exits_placed": b.get("p_exits_placed") is True,
+                "qty_open": b.get("p_qty_open"),
+            })
+            return httpx.Response(200, content=b"null", headers={"content-type": "application/json"})
         if p == "/rest/v1/contract_picks" and req.method == "POST":
             self.picks.append(b)
             return httpx.Response(201, content=b"", headers={"content-type": "application/json"})
         return httpx.Response(404)
 
 
-def make(tmp_path, mode="PREFLIGHT", confirm="", clock=lambda: OPEN_TIME, sb=None, public=None, **over):
+async def _no_sleep(_seconds: float) -> None:
+    return None
+
+
+class FakeAlpaca:
+    """httpx stand-in for https://paper-api.alpaca.markets. Buy-to-open fills unless entry_status says otherwise."""
+
+    def __init__(self, missing=None, ppind=False, entry_status="filled"):
+        self.orders = {}
+        self.calls = []
+        self.deletes = []
+        self.missing = set(missing or [])
+        self.ppind = ppind
+        self.entry_status = entry_status
+        self.account = {"status": "ACTIVE", "equity": "100000", "cash": "50", "buying_power": "999"}
+        self._seq = 0
+
+    def __call__(self, req: httpx.Request) -> httpx.Response:
+        self.calls.append(req)
+        assert req.headers["APCA-API-KEY-ID"] == "alpaca-key"
+        assert req.headers["APCA-API-SECRET-KEY"] == "alpaca-secret"
+        path = req.url.path
+        if path == "/v2/account" and req.method == "GET":
+            return httpx.Response(200, json=self.account)
+        if path.startswith("/v2/options/contracts/") and req.method == "GET":
+            symbol = path.rsplit("/", 1)[-1]
+            if symbol in self.missing:
+                return httpx.Response(404, json={"message": "contract not found"})
+            return httpx.Response(200, json={
+                "symbol": symbol, "status": "active", "tradable": True, "ppind": self.ppind,
+            })
+        if path == "/v2/orders" and req.method == "POST":
+            body = json.loads(req.content)
+            self._seq += 1
+            oid = f"alp-{self._seq}"
+            intent = body.get("position_intent")
+            status = self.entry_status if intent == "buy_to_open" else "new"
+            filled = body["qty"] if status == "filled" else "0"
+            order = {
+                "id": oid, "status": status, "filled_qty": filled,
+                "filled_avg_price": body.get("limit_price") if status == "filled" else None,
+                "symbol": body.get("symbol"), "qty": body.get("qty"), "type": body.get("type"),
+                "side": body.get("side"), "limit_price": body.get("limit_price"),
+                "stop_price": body.get("stop_price"), "position_intent": intent,
+                "client_order_id": body.get("client_order_id"), "time_in_force": body.get("time_in_force"),
+            }
+            self.orders[oid] = order
+            return httpx.Response(200, json=order)
+        if req.method == "GET" and path.startswith("/v2/orders/"):
+            order = self.orders.get(path.rsplit("/", 1)[-1])
+            if order is None:
+                return httpx.Response(404, json={"message": "order not found"})
+            return httpx.Response(200, json=order)
+        if req.method == "DELETE" and path.startswith("/v2/orders/"):
+            oid = path.rsplit("/", 1)[-1]
+            self.deletes.append(oid)
+            order = self.orders.get(oid)
+            if order is None:
+                return httpx.Response(404, json={"message": "order not found"})
+            if order["status"] == "filled":
+                return httpx.Response(422, json={"message": "order is already filled"})
+            order["status"] = "canceled"
+            return httpx.Response(204)
+        return httpx.Response(404, json={"message": path})
+
+    def posts(self):
+        return [json.loads(call.content) for call in self.calls
+                if call.method == "POST" and call.url.path == "/v2/orders"]
+
+
+def make(tmp_path, mode="PREFLIGHT", confirm="", clock=lambda: OPEN_TIME, sb=None, public=None,
+         alpaca=None, **over):
     env = {"PUBLIC_SECRET": SECRET, "WEBHOOK_PASSPHRASE": PASS, "MODE": mode, "LIVE_CONFIRM": confirm,
            "ALLOWLIST": "AAPL,SPY", "SUPABASE_URL": "https://x.supabase.co", "SUPABASE_SERVICE_KEY": "svc-key", **over}
     fake = public or FakePublic()
     sb = sb or FakeSupabase()
+    alpaca_transport = None
+    if mode == "PAPER":
+        env.setdefault("ALPACA_KEY_ID", "alpaca-key")
+        env.setdefault("ALPACA_SECRET_KEY", "alpaca-secret")
+        alpaca = alpaca if alpaca is not None else FakeAlpaca()
+        alpaca_transport = httpx.MockTransport(alpaca)
     a = relay.create_app(relay.Settings.from_env(env), transport=httpx.MockTransport(fake),
-                         store_transport=httpx.MockTransport(sb), clock=clock)
+                         store_transport=httpx.MockTransport(sb), clock=clock,
+                         alpaca_transport=alpaca_transport, sleeper=_no_sleep)
     c = TestClient(a)
     c.sb = sb
+    c.alpaca = alpaca
     return c, fake
 
 
@@ -323,7 +434,9 @@ def test_keepalive(tmp_path, monkeypatch):
     assert c.get("/keepalive", headers={"Authorization": "Bearer nope"}).status_code == 401
     r = c.get("/keepalive", headers={"Authorization": "Bearer cron-s"})
     assert r.status_code == 200 and r.json()["ok"] is True
+    assert "reconciled" not in r.json()
     assert any(x.url.path == "/rest/v1/daily_counters" for x in c.sb.calls)
+    assert not any(x.url.path.endswith("relay_list_open_positions") for x in c.sb.calls)
     assert fake.calls == []  # never touches Public
 
 
@@ -776,7 +889,12 @@ def test_settings_defaults_overrides_and_live_gate():
         relay.Settings.from_env({"STOP_LOSS_PERCENT": "0"})
     with pytest.raises(ValueError):
         relay.Settings.from_env({"STOP_LOSS_PERCENT": "100"})
-    assert relay.stop_price(Decimal("1.45"), Decimal("30")) == Decimal("1.015")
+    assert relay.stop_price(Decimal("1.45"), Decimal("30")) == Decimal("1.02")
+    assert relay.round_option_price(Decimal("1.015")) == Decimal("1.02")
+    assert relay.option_tick(Decimal("3")) == Decimal("0.05")
+    assert relay.round_option_price(Decimal("3")) == Decimal("3.00")
+    assert relay.round_option_price(Decimal("4.51")) == Decimal("4.50")
+    assert relay.round_option_price(Decimal("4.51"), penny=True) == Decimal("4.51")
     assert relay.price_text(Decimal("1.015")) == "1.015"
     assert relay.price_text(Decimal("1.020")) == "1.02"
     assert relay.price_text(Decimal("1")) == "1.00"
@@ -795,6 +913,23 @@ def test_settings_defaults_overrides_and_live_gate():
     assert over.max_exit_orders_per_day == 4 and over.max_orders_per_day == 5
     assert relay.Settings.from_env({"MODE": "LIVE"}).mode == "PREFLIGHT"
     assert relay.Settings.from_env({"MODE": "LIVE", "LIVE_CONFIRM": "I_UNDERSTAND"}).mode == "LIVE"
+    hidden = relay.Settings.from_env({
+        "MODE": "PREFLIGHT", "ALPACA_KEY_ID": "alpaca-key", "ALPACA_SECRET_KEY": "alpaca-secret",
+        "ALPACA_BASE_URL": "https://api.alpaca.markets",
+    })
+    assert hidden.mode == "PREFLIGHT" and hidden.alpaca_key_id == "" and hidden.alpaca_secret_key == ""
+    assert hidden.alpaca_base_url == ""
+    paper = relay.Settings.from_env({"MODE": "paper", "ALPACA_KEY_ID": "alpaca-key", "ALPACA_SECRET_KEY": "alpaca-secret"})
+    assert paper.mode == "PAPER" and paper.alpaca_base_url == "https://paper-api.alpaca.markets"
+    assert paper.alpaca_key_id == "alpaca-key" and paper.public_view()["alpaca_configured"] is True
+    assert "alpaca-secret" not in json.dumps(paper.public_view())
+    with pytest.raises(ValueError):
+        relay.Settings.from_env({"MODE": "PAPER"})
+    with pytest.raises(ValueError):
+        relay.Settings.from_env({
+            "MODE": "PAPER", "ALPACA_KEY_ID": "alpaca-key", "ALPACA_SECRET_KEY": "alpaca-secret",
+            "ALPACA_BASE_URL": "https://api.alpaca.markets",
+        })
     with pytest.raises(ValueError):
         relay.Settings.from_env({"DELTA_BAND_MIN": "0.80", "DELTA_BAND_MAX": "0.20"})
     with pytest.raises(ValueError):
@@ -825,8 +960,10 @@ def test_health_lists_tunables(tmp_path):
     assert settings["max_orders_per_day"] == 3 and settings["max_daily_opens"] == "300"
     assert settings["max_premium"] == "2.00" and settings["max_exit_orders_per_day"] == 6
     assert settings["open_limit_fallback"] == "ask" and settings["close_limit_fallback"] == "bid"
-    assert settings["stop_loss_percent"] is None
+    assert settings["stop_loss_percent"] is None and settings["alpaca_configured"] is False
     assert PASS not in json.dumps(settings) and "secret" not in json.dumps(settings)
+    health = c.get("/health").json()
+    assert health["mode"] == "PREFLIGHT" and health["alpaca_configured"] is False and "alpaca" not in health
 
 
 def test_env_changes_band_window_expiry_and_fallback(tmp_path):
@@ -1132,20 +1269,20 @@ def test_qty2_loss_flatten_sells_the_unfilled_take_profit_and_the_runners(tmp_pa
     assert tp["attached"] is True and tp["quantity"] == 1 and tp["qty_open"] == 2 and tp["runners"] == 1
     assert tp["limit_price"] == "1.74" and "orderId" not in tp["order"]
     assert stop["attached"] is True and stop["status"] == "RESTING" and stop["quantity"] == 2
-    assert stop["order_type"] == "STOP_LIMIT" and stop["stop_price"] == "1.015" and stop["limit_price"] == "1.015"
+    assert stop["order_type"] == "STOP_LIMIT" and stop["stop_price"] == "1.02" and stop["limit_price"] == "1.02"
     assert stop["order"]["orderType"] == "STOP_LIMIT" and stop["order"]["quantity"] == "2"
-    assert stop["order"]["stopPrice"] == "1.015" and stop["order"]["limitPrice"] == "1.015"
+    assert stop["order"]["stopPrice"] == "1.02" and stop["order"]["limitPrice"] == "1.02"
     assert stop["order"]["orderSide"] == "SELL" and stop["order"]["openCloseIndicator"] == "CLOSE"
     assert "orderId" not in stop["order"] and stop["orderId"] and "reported only" in stop["note"]
     preflights = ending(fake, "/preflight/single-leg")
     assert len(preflights) == 3
     stop_request = json.loads(preflights[2].content)
-    assert stop_request["orderType"] == "STOP_LIMIT" and stop_request["stopPrice"] == "1.015"
+    assert stop_request["orderType"] == "STOP_LIMIT" and stop_request["stopPrice"] == "1.02"
     assert "orderId" not in stop_request
     assert c.get("/health").json()["settings"]["stop_loss_percent"] == "30"
     pos = saved_position(c)
     assert pos["qty_open"] == 2 and pos["tp_qty"] == 1 and pos["stop_qty"] == 2
-    assert pos["stop_status"] == "RESTING" and pos["stop_limit"] == "1.015" and pos["tp_filled"] == 0
+    assert pos["stop_status"] == "RESTING" and pos["stop_limit"] == "1.02" and pos["tp_filled"] == 0
     assert not any(call.method == "GET" and "/order/" in call.url.path for call in fake.calls)
     assert not ending(fake, "/order")
 
@@ -1247,7 +1384,7 @@ def test_live_win_reconciles_the_take_profit_fill_and_places_only_the_sell(tmp_p
     opened = c.post("/webhook", json=underlying(qty=2, alert_id="live-win"))
     assert opened.status_code == 200, opened.text
     assert opened.json()["order_placed"] is True
-    assert opened.json()["stop"]["attached"] is True and opened.json()["stop"]["stop_price"] == "1.015"
+    assert opened.json()["stop"]["attached"] is True and opened.json()["stop"]["stop_price"] == "1.02"
     assert len(ending(fake, "/order")) == 1
     assert len(ending(fake, "/preflight/single-leg")) == 3
     pos = saved_position(c, "LIVE")
@@ -1299,3 +1436,248 @@ def test_live_order_status_failure_leaves_the_position_open(tmp_path):
     assert "order status failed" in flat.json()["error"]
     assert saved_position(c, "LIVE")["status"] == "OPEN"
     assert len(ending(fake, "/order")) == 1
+
+
+def test_alpaca_symbol_tick_and_zero_dte_cutoff():
+    assert relay.alpaca_option_symbol("SPY   261019C00579000") == CHOSEN_CALL
+    today = date(2026, 10, 19)
+    at_1530 = datetime(2026, 10, 19, 15, 30, tzinfo=ET)
+    at_1529 = datetime(2026, 10, 19, 15, 29, tzinfo=ET)
+    assert "15:30" in relay.paper_entry_cutoff("SPY", today, at_1530)
+    assert "15:45" in relay.paper_entry_cutoff("QQQ", today, at_1530)
+    assert relay.paper_entry_cutoff("SPY", today, at_1529) is None
+    assert "15:15" in relay.paper_entry_cutoff("AAPL", today, datetime(2026, 10, 19, 15, 15, tzinfo=ET))
+    assert relay.paper_entry_cutoff("AAPL", today, datetime(2026, 10, 19, 15, 14, tzinfo=ET)) is None
+    assert relay.paper_entry_cutoff("SPY", date(2026, 10, 21), datetime(2026, 10, 19, 15, 40, tzinfo=ET)) is None
+    assert relay.alpaca_order_state({"status": "filled", "filled_qty": "2"}, 2) == ("FILLED", 2)
+    assert relay.alpaca_order_state({"status": "new", "filled_qty": "0"}, 2) == ("RESTING", 0)
+    assert relay.alpaca_order_state({"status": "partially_filled", "filled_qty": "1"}, 2) == ("PARTIAL", 1)
+    assert relay.alpaca_order_state({"status": "canceled", "filled_qty": "1"}, 2) == ("CANCELLED", 1)
+    with pytest.raises(relay.Reject):
+        relay.alpaca_order_state({"status": "weird", "filled_qty": "0"}, 1)
+
+
+def _paper(tmp_path, alpaca=None, **over):
+    broker = alpaca if alpaca is not None else FakeAlpaca()
+    over.setdefault("MAX_QTY", "2")
+    over.setdefault("MAX_DAILY_OPENS", "1000")
+    over.setdefault("STOP_LOSS_PERCENT", "30")
+    client, public = make(tmp_path, mode="PAPER", public=ChainPublic(quotes=CLOSE_QUOTE), alpaca=broker, **over)
+    return client, public, broker
+
+
+def test_paper_health_checks_the_account_without_balances(tmp_path):
+    client, _public, _broker = _paper(tmp_path)
+    body = client.get("/health").json()
+    assert body["mode"] == "PAPER" and body["alpaca_configured"] is True
+    assert body["alpaca"]["ok"] is True and body["alpaca"]["status"] == "ACTIVE"
+    assert body["alpaca"]["equity"] == "100000"
+    assert "cash" not in body["alpaca"] and "buying_power" not in body["alpaca"]
+    assert "alpaca-secret" not in client.get("/health").text and "alpaca-key" not in client.get("/health").text
+
+
+def test_paper_rejects_a_missing_contract_without_an_order(tmp_path):
+    broker = FakeAlpaca(missing={CHOSEN_CALL})
+    client, public, broker = _paper(tmp_path, broker)
+    response = client.post("/webhook", json=underlying(qty=2, alert_id="missing"))
+    assert response.status_code == 422, response.text
+    assert CHOSEN_CALL in response.json()["error"]
+    assert broker.posts() == []
+    assert ("SPY", "FlowVWAP", "PAPER") not in client.sb.positions
+    assert client.sb.counters.get(("2026-10-19", "PAPER"), [0])[0] == 0
+    assert not ending(public, "/order") and not ending(public, "/preflight/single-leg")
+
+
+def test_paper_rejects_new_zero_dte_entries_at_the_alpaca_cutoff(tmp_path):
+    late = datetime(2026, 10, 19, 15, 30, tzinfo=ET)
+    client, public, broker = _paper(tmp_path, clock=lambda: late)
+    response = client.post("/webhook", json=underlying(qty=2, alert_id="late-spy"))
+    assert response.status_code == 422, response.text
+    assert "15:30" in response.json()["error"] and "15:45" in response.json()["error"]
+    assert not ending(public, "/option-chain")
+    assert broker.posts() == []
+
+    earlier = datetime(2026, 10, 19, 15, 15, tzinfo=ET)
+    aapl, aapl_public, aapl_broker = _paper(tmp_path / "aapl", clock=lambda: earlier)
+    blocked = aapl.post("/webhook", json=underlying(symbol="AAPL", underlying_price="180", alert_id="late-aapl"))
+    assert blocked.status_code == 422, blocked.text
+    assert "15:15" in blocked.json()["error"]
+    assert not ending(aapl_public, "/option-chain")
+    assert aapl_broker.posts() == []
+
+
+def test_paper_qty2_places_the_entry_take_profit_and_stop(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="relay")
+    client, public, broker = _paper(tmp_path)
+    opened = client.post("/webhook", json=underlying(qty=2, alert_id="paper-open"))
+    assert opened.status_code == 200, opened.text
+    body = opened.json()
+    assert body["order_placed"] is True and body["broker"] == "alpaca" and body["mode"] == "PAPER"
+    assert body["entry_status"] == "FILLED" and body["filled_qty"] == 2
+    entry, take_profit, stop = broker.posts()
+    assert entry["symbol"] == CHOSEN_CALL and " " not in entry["symbol"]
+    assert entry["side"] == "buy" and entry["type"] == "limit" and entry["position_intent"] == "buy_to_open"
+    assert entry["limit_price"] == "1.45" and entry["qty"] == "2" and entry["time_in_force"] == "day"
+    assert take_profit["side"] == "sell" and take_profit["type"] == "limit"
+    assert take_profit["position_intent"] == "sell_to_close" and take_profit["qty"] == "1"
+    assert take_profit["limit_price"] == "1.74"
+    assert stop["type"] == "stop_limit" and stop["side"] == "sell" and stop["qty"] == "2"
+    assert stop["stop_price"] == "1.02" and stop["limit_price"] == "1.02"
+    assert stop["position_intent"] == "sell_to_close"
+    assert body["take_profit"]["orderId"] == "alp-2" and body["stop"]["orderId"] == "alp-3"
+    assert not ending(public, "/order") and not ending(public, "/preflight/single-leg")
+    pos = saved_position(client, "PAPER")
+    assert pos["status"] == "OPEN" and pos["entry_status"] == "FILLED" and pos["exits_placed"] is True
+    assert pos["tp_qty"] == 1 and pos["stop_qty"] == 2 and pos["stop_limit"] == "1.02"
+    assert client.sb.counters[("2026-10-19", "PAPER")][0] == 1
+    assert client.sb.exit_orders[("2026-10-19", "PAPER")] == 2
+    blob = opened.text + caplog.text
+    assert "alpaca-secret" not in blob and "alpaca-key" not in blob and PASS not in opened.text
+
+
+def test_paper_pending_fill_attaches_exits_on_keepalive(tmp_path, monkeypatch):
+    monkeypatch.setenv("CRON_SECRET", "cron-s")
+    broker = FakeAlpaca(entry_status="new")
+    client, _public, broker = _paper(tmp_path, broker)
+    opened = client.post("/webhook", json=underlying(qty=2, alert_id="paper-wait"))
+    assert opened.status_code == 200, opened.text
+    assert opened.json()["entry_status"] == "PENDING" and opened.json()["filled_qty"] == 0
+    assert opened.json()["take_profit"]["attached"] is False
+    assert len(broker.posts()) == 1
+    pos = saved_position(client, "PAPER")
+    assert pos["entry_status"] == "PENDING" and pos["exits_placed"] is False and pos["qty_open"] == 0
+    order = broker.orders[opened.json()["alpaca_order_id"]]
+    order["status"] = "filled"
+    order["filled_qty"] = "2"
+    order["filled_avg_price"] = "1.45"
+    kept = client.get("/keepalive", headers={"Authorization": "Bearer cron-s"})
+    assert kept.status_code == 200, kept.text
+    assert kept.json()["reconciled"][0]["exits_placed"] is True
+    assert len(broker.posts()) == 3
+    assert saved_position(client, "PAPER")["exits_placed"] is True
+    again = client.get("/keepalive", headers={"Authorization": "Bearer cron-s"})
+    assert again.status_code == 200, again.text
+    assert len(broker.posts()) == 3
+
+
+def test_paper_flatten_cancels_working_exits_and_sells_the_remainder(tmp_path):
+    client, public, broker = _paper(tmp_path)
+    opened = client.post("/webhook", json=underlying(qty=2, alert_id="paper-loss"))
+    assert opened.status_code == 200, opened.text
+    take_profit = opened.json()["take_profit"]["orderId"]
+    stop = opened.json()["stop"]["orderId"]
+    flat = client.post("/webhook", json=flatten_alert("paper-flat-loss"))
+    assert flat.status_code == 200, flat.text
+    closed = flat.json()
+    assert closed["order_placed"] is True and closed["contracts_closed"] == 2
+    assert closed["runners_closed"] == 1 and closed["take_profit_contracts_closed"] == 1
+    assert closed["order"]["qty"] == "2" and closed["order"]["limit_price"] == "1.20"
+    assert closed["order"]["position_intent"] == "sell_to_close"
+    assert closed["cancel_take_profit"]["orderId"] == take_profit
+    assert closed["cancel_stop"]["orderId"] == stop
+    assert set(broker.deletes) == {take_profit, stop}
+    assert saved_position(client, "PAPER")["status"] == "CLOSED"
+    assert client.sb.counters[("2026-10-19", "PAPER")][0] == 1
+    assert client.sb.exit_orders[("2026-10-19", "PAPER")] == 3
+    assert not ending(public, "/order")
+
+
+def test_paper_win_sells_only_the_runner(tmp_path):
+    client, _public, broker = _paper(tmp_path)
+    opened = client.post("/webhook", json=underlying(qty=2, alert_id="paper-win"))
+    take_profit = opened.json()["take_profit"]["orderId"]
+    stop = opened.json()["stop"]["orderId"]
+    filled = broker.orders[take_profit]
+    filled["status"] = "filled"
+    filled["filled_qty"] = "1"
+    filled["filled_avg_price"] = "1.74"
+    flat = client.post("/webhook", json=flatten_alert("paper-flat-win"))
+    assert flat.status_code == 200, flat.text
+    closed = flat.json()
+    assert closed["contracts_closed"] == 1 and closed["runners_closed"] == 1
+    assert closed["order"]["qty"] == "1" and closed["order"]["limit_price"] == "1.20"
+    assert take_profit not in broker.deletes and stop in broker.deletes
+    saved = saved_position(client, "PAPER")
+    assert saved["status"] == "CLOSED" and saved["tp_status"] == "FILLED" and saved["tp_filled"] == 1
+    assert saved["stop_status"] == "CANCELLED"
+
+
+def test_paper_stop_hit_sells_nothing(tmp_path):
+    client, public, broker = _paper(tmp_path)
+    opened = client.post("/webhook", json=underlying(qty=2, alert_id="paper-stopped"))
+    take_profit = opened.json()["take_profit"]["orderId"]
+    stop = opened.json()["stop"]["orderId"]
+    broker.orders[stop]["status"] = "filled"
+    broker.orders[stop]["filled_qty"] = "2"
+    flat = client.post("/webhook", json=flatten_alert("paper-flat-stop"))
+    assert flat.status_code == 200, flat.text
+    body = flat.json()
+    assert body["order_placed"] is False and body["contracts_closed"] == 0
+    assert "order" not in body
+    assert body["cancel_take_profit"]["orderId"] == take_profit
+    assert stop not in broker.deletes and take_profit in broker.deletes
+    assert len(broker.posts()) == 3
+    saved = saved_position(client, "PAPER")
+    assert saved["status"] == "CLOSED" and saved["stop_status"] == "FILLED" and saved["stop_filled"] == 2
+    assert saved["tp_status"] == "CANCELLED"
+    assert client.sb.exit_orders[("2026-10-19", "PAPER")] == 2
+    assert not ending(public, "/quotes")
+
+
+def test_paper_pending_flatten_cancels_the_entry_and_does_not_sell(tmp_path):
+    broker = FakeAlpaca(entry_status="new")
+    client, _public, broker = _paper(tmp_path, broker)
+    opened = client.post("/webhook", json=underlying(qty=2, alert_id="paper-unfilled"))
+    entry_id = opened.json()["alpaca_order_id"]
+    flat = client.post("/webhook", json=flatten_alert("paper-cancel-entry"))
+    assert flat.status_code == 200, flat.text
+    assert flat.json()["order_placed"] is False and flat.json()["contracts_closed"] == 0
+    assert broker.posts() == [broker.posts()[0]]
+    assert entry_id in broker.deletes
+    assert saved_position(client, "PAPER")["status"] == "CLOSED"
+
+
+def test_paper_exits_ignore_the_entry_cap(tmp_path):
+    client, _public, broker = _paper(tmp_path, MAX_ORDERS_PER_DAY="1", EXITS_COUNT_TOWARD_ORDER_CAP="true")
+    assert client.post("/webhook", json=underlying(qty=2, alert_id="cap-open")).status_code == 200
+    blocked = client.post("/webhook", json=underlying(qty=2, alert_id="cap-again", strategy="Other"))
+    assert blocked.status_code == 422, blocked.text
+    assert "MAX_ORDERS_PER_DAY" in blocked.json()["error"]
+    assert client.sb.counters[("2026-10-19", "PAPER")][0] == 1
+    assert client.sb.exit_orders[("2026-10-19", "PAPER")] == 2
+    flat = client.post("/webhook", json=flatten_alert("cap-flat"))
+    assert flat.status_code == 200, flat.text
+    assert flat.json()["order_placed"] is True and flat.json()["contracts_closed"] == 2
+    assert client.sb.counters[("2026-10-19", "PAPER")][0] == 1
+    assert client.sb.exit_orders[("2026-10-19", "PAPER")] == 3
+    assert len(broker.posts()) == 4
+
+
+def test_paper_penny_program_keeps_the_cent_above_three_dollars(tmp_path):
+    calls = [("579", "0.55", "4.00", "4.20")]
+    chain = spy_chain(calls=calls, puts=[])
+    greeks = greek_map(calls, "C")
+
+    def run(ppind):
+        broker = FakeAlpaca(ppind=ppind)
+        client, _public = make(
+            tmp_path / str(ppind), mode="PAPER", public=ChainPublic(chain=chain, greeks=greeks), alpaca=broker,
+            MAX_QTY="2", MAX_DAILY_OPENS="5000", MAX_PREMIUM="5", TP_PERCENT="10")
+        opened = client.post("/webhook", json=underlying(qty=2, alert_id=f"penny-{ppind}"))
+        assert opened.status_code == 200, opened.text
+        return broker.posts()[1]["limit_price"]
+
+    assert run(False) == "4.50"
+    assert run(True) == "4.51"
+
+
+def test_paper_occ_open_is_placed_and_not_stored(tmp_path):
+    client, public, broker = _paper(tmp_path, STOP_LOSS_PERCENT="")
+    response = client.post("/webhook", json=alert(alert_id="occ-paper"))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["order_placed"] is True and body["broker"] == "alpaca" and body["selection"] is None
+    assert broker.posts()[0]["symbol"] == "AAPL261120C00250000"
+    assert broker.posts()[0]["position_intent"] == "buy_to_open"
+    assert client.sb.positions == {}
+    assert not ending(public, "/order")
