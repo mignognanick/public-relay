@@ -42,7 +42,7 @@ are unchanged: LIVE still requires both `MODE=LIVE` and `LIVE_CONFIRM=I_UNDERSTA
 | `MAX_QTY` | `1` | Max contracts on one order (1–100). Partial take-profit needs this at least 2, unless `TP_SINGLE` is on. |
 | `MAX_PREMIUM` | `5.00` | Max limit price on an entry. Closes and flattens are never blocked by it, and the take-profit limit and the stop price are outside this check. |
 | `MAX_ORDERS_PER_DAY` | `3` | Entry orders per ET day, counted separately for PREFLIGHT, PAPER, and LIVE. |
-| `MAX_DAILY_OPENS` | `300` | Max dollars of premium on OPEN orders per ET day. The entry spends `limit × full qty × 100`. |
+| `MAX_DAILY_OPENS` | `1500` | Max dollars of premium on OPEN orders per ET day. The entry spends `limit × full qty × 100`. |
 | `MAX_EXIT_ORDERS_PER_DAY` | `6` | Take-profit, stop, and flatten orders per ET day. A round trip that attaches both exits uses 3. The default fits two of those. |
 | `EXITS_COUNT_TOWARD_ORDER_CAP` | `false` | When `true`, a take-profit, stop, or flatten also consumes `MAX_ORDERS_PER_DAY`. |
 | `ENFORCE_MARKET_HOURS` | `true` | Reject outside Mon–Fri 09:31–15:55 ET. Holidays are not detected. |
