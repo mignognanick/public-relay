@@ -40,7 +40,7 @@ are unchanged: LIVE still requires both `MODE=LIVE` and `LIVE_CONFIRM=I_UNDERSTA
 | `PUBLIC_ACCOUNT_ID` | empty | Account to trade. Blank picks the first account that reports an options level. |
 | `ALLOWLIST` | empty | Comma-separated underlyings. Empty allows nothing. |
 | `MAX_QTY` | `1` | Max contracts on one order (1–100). Partial take-profit needs this at least 2, unless `TP_SINGLE` is on. |
-| `MAX_PREMIUM` | `2.00` | Max limit price on an entry or a flatten. The take-profit limit and the stop price are outside this check. |
+| `MAX_PREMIUM` | `5.00` | Max limit price on an entry. Closes and flattens are never blocked by it, and the take-profit limit and the stop price are outside this check. |
 | `MAX_ORDERS_PER_DAY` | `3` | Entry orders per ET day, counted separately for PREFLIGHT, PAPER, and LIVE. |
 | `MAX_DAILY_OPENS` | `300` | Max dollars of premium on OPEN orders per ET day. The entry spends `limit × full qty × 100`. |
 | `MAX_EXIT_ORDERS_PER_DAY` | `6` | Take-profit, stop, and flatten orders per ET day. A round trip that attaches both exits uses 3. The default fits two of those. |
