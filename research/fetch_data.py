@@ -9,8 +9,9 @@ the saved tool responses in `research/data/raw/` into the normalized files `back
     python research/fetch_data.py ingest         # raw/* -> underlying.json, instruments.json, option_bars.json
 
 Underlying bars: get_equity_historicals (SPY, QQQ, IWM) and get_index_historicals (SPX, one week per call),
-5-minute, regular hours. Option bars: 5-minute marks for a handful of near-the-money 0DTE contracts per
-session, used to calibrate an implied-volatility smile (see `pricing.py`).
+5-minute, regular hours. Option bars: 5-minute marks (10-minute before FIVE_MINUTE_OPTIONS_FROM) for a
+handful of near-the-money 0DTE contracts per session, used to calibrate an implied-volatility smile
+(see `pricing.py`).
 """
 
 from __future__ import annotations
