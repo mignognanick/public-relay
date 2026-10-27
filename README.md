@@ -9,12 +9,15 @@
   `0005_paper_orders.sql` adds the Alpaca entry columns and replaces `relay_record_open` again, and adds
   `relay_list_open_positions` and `relay_save_paper`. Apply it before `MODE=PAPER`. Fails closed (503)
   if Supabase is unreachable.
-- An alert can send a full OCC symbol, unchanged, or just an underlying (`SPY`). BUY selects a call and
+- An alert can send a full OCC symbol, unchanged, or just an underlying (`SPY` or `QQQ`). BUY selects a call and
   SELL a put. Defaults: expiry is today (0DTE) in America/New_York, strikes from ATM through 5 points ITM,
   `|delta|` closest to 0.50–0.60 (then to the middle of that band, then to the underlying price). The open
   limit is the bid/ask mid, or the ask if the mid is missing. A flatten, CLOSE, reversal, or opposite-side
   alert cancels a resting take-profit and stop, then sells every contract still open (runners and any
   take-profit contracts that have not filled). It does not open the other side on the same alert.
+  The position key is underlying + strategy + mode, so a QQQ flatten cannot close a SPY position.
+  `QQQ_EMA_VWAP` has its own selection and exit defaults; `FlowVWAP` keeps the global env values.
+  No new Supabase migration: `0005_paper_orders.sql` is still the latest.
   `underlying_price` (`{{close}}`) sets ATM; if it is missing, the relay uses the equity quote.
   The pick is written to `contract_picks` and returned as `selection`, with the order that would have been
   sent as `order`. Templates are in `sample_alert.json`. Defaults stay MODE=PREFLIGHT.
@@ -23,7 +26,7 @@
   is sent to `/order`, including when an entry itself is live. See the settings table.
 - Public token cached per warm instance, refreshed 2 min before expiry or on 401.
 - Tests: `pip install -r requirements.txt -r requirements-dev.txt && pytest -q tests` (Public + Supabase mocked).
-- Endpoints: `GET /health` (includes the non-secret `settings` block), `POST /webhook`.
+- Endpoints: `GET /health` (includes the non-secret `settings` block), `POST /webhook`, `POST /preflight`.
 
 Tunables are read from the environment when the instance starts. Changing one needs a restart (or a new
 Vercel deployment that already has the variable). This repo does not set them. `MODE` and `LIVE_CONFIRM`
@@ -38,29 +41,57 @@ are unchanged: LIVE still requires both `MODE=LIVE` and `LIVE_CONFIRM=I_UNDERSTA
 | `MODE` | `PREFLIGHT` | `PREFLIGHT` never places an order. `LIVE` is ignored unless `LIVE_CONFIRM` matches. `PAPER` places on Alpaca paper and does not read `LIVE_CONFIRM`. |
 | `LIVE_CONFIRM` | empty | Must be exactly `I_UNDERSTAND` together with `MODE=LIVE`. |
 | `PUBLIC_ACCOUNT_ID` | empty | Account to trade. Blank picks the first account that reports an options level. |
-| `ALLOWLIST` | empty | Comma-separated underlyings. Empty allows nothing. |
-| `MAX_QTY` | `1` | Max contracts on one order (1–100). Partial take-profit needs this at least 2, unless `TP_SINGLE` is on. |
-| `MAX_PREMIUM` | `5.00` | Max limit price on an entry. Closes and flattens are never blocked by it, and the take-profit limit and the stop price are outside this check. |
-| `MAX_ORDERS_PER_DAY` | `3` | Entry orders per ET day, counted separately for PREFLIGHT, PAPER, and LIVE. |
-| `MAX_DAILY_OPENS` | `1500` | Max dollars of premium on OPEN orders per ET day. The entry spends `limit × full qty × 100`. |
+| `ALLOWLIST` | empty | Comma-separated underlyings. Empty allows nothing else. `QQQ` is always added, so this does not need an edit for the new strategy. `SPY` stays on this list (production already has it; do not remove it). |
+| `MAX_QTY` | `1` | Max contracts on one order (1–100). Partial take-profit needs this at least 2, unless `TP_SINGLE` is on. Overridable per strategy. |
+| `MAX_PREMIUM` | `5.00` | Max limit price on an entry. A close or flatten is never blocked by this cap, for any strategy. The take-profit limit and the stop price are also outside this check. Overridable per strategy. |
+| `STRATEGY_OVERRIDES` | empty | Optional JSON object keyed by the alert's `strategy` field. Merges on top of the checked-in profiles. Leave unset to use the shipped `QQQ_EMA_VWAP` defaults. |
+| `MAX_ORDERS_PER_DAY` | `3` | Entry orders per ET day, counted separately for PREFLIGHT, PAPER, and LIVE. Shared across strategies. |
+| `MAX_DAILY_OPENS` | `1500` | Max dollars of premium on OPEN orders per ET day. The entry spends `limit × full qty × 100`. Shared across strategies. Production sets `1000` explicitly; leave that value as it is. |
 | `MAX_EXIT_ORDERS_PER_DAY` | `6` | Take-profit, stop, and flatten orders per ET day. A round trip that attaches both exits uses 3. The default fits two of those. |
 | `EXITS_COUNT_TOWARD_ORDER_CAP` | `false` | When `true`, a take-profit, stop, or flatten also consumes `MAX_ORDERS_PER_DAY`. |
 | `ENFORCE_MARKET_HOURS` | `true` | Reject outside Mon–Fri 09:31–15:55 ET. Holidays are not detected. |
-| `DELTA_BAND_MIN` | `0.50` | Low end of the absolute-delta band (0–1, and `min ≤ max`). |
-| `DELTA_BAND_MAX` | `0.60` | High end of that band. |
-| `ITM_POINTS` | `5` | How far in the money strikes may be (0–50). 0 is ATM only. |
+| `DELTA_BAND_MIN` | `0.50` | Low end of the absolute-delta band (0–1, and `min ≤ max`). Overridable per strategy. |
+| `DELTA_BAND_MAX` | `0.60` | High end of that band. Overridable per strategy. |
+| `ITM_POINTS` | `5` | How far in the money strikes may be (0–50). 0 is ATM only. Overridable per strategy. |
 | `EXPIRY_DAYS` | `0` | Calendar days after today ET (0–30). `0` is 0DTE. The chain must list that date. |
 | `OPEN_LIMIT_FALLBACK` | `ask` | When bid/ask mid is missing on an open: `ask`, `bid`, or `reject`. |
 | `CLOSE_LIMIT_FALLBACK` | `bid` | Same choice for a flatten. The sell uses the bid/ask mid, then this fallback. |
-| `TP_PERCENT` | `20` | Take-profit limit is entry × (1 + this / 100). `20` is 20% above the entry. |
+| `TP_PERCENT` | `20` | Take-profit limit is entry × (1 + this / 100). `20` is 20% above the entry. Overridable per strategy. |
 | `TP_FRACTION` | `0.50` | Share of contracts to sell at that limit. Rounded down, and at least 1 when quantity is 2 or more. |
-| `TP_SINGLE` | `false` | When `true`, a 1-contract open also gets a take-profit. A later flatten cancels it and sells the contract if it is still open. |
-| `STOP_LOSS_PERCENT` | empty | Off when empty. When set, stop price is entry × (1 − this / 100), then rounded to the option tick. `30` on a 1.45 entry is 1.015, which is sent as 1.02. Must be greater than 0 and less than 100. |
+| `TP_SINGLE` | `false` | When `true`, a 1-contract open also gets a take-profit. A later flatten cancels it and sells the contract if it is still open. Overridable per strategy. |
+| `STOP_LOSS_PERCENT` | empty | Off when empty. When set, stop price is entry × (1 − this / 100), then rounded to the option tick. `30` on a 1.45 entry is 1.015, which is sent as 1.02. Must be greater than 0 and less than 100. Overridable per strategy. `null` in a profile turns the stop off for that strategy even when this variable is set. |
 | `SUPABASE_URL` | empty | Project URL. |
 | `SUPABASE_SERVICE_KEY` | empty | Service-role key. Server only. |
 | `CRON_SECRET` | empty | Bearer token for `GET /keepalive`. |
 
-`/health` returns every tunable above except the secrets.
+`/health` returns every tunable above except the secrets. `settings.strategies` is the effective per-strategy block (built-in profiles plus `STRATEGY_OVERRIDES`). A strategy that is not listed there, including `FlowVWAP`, uses the global `settings` values. `settings.daily_caps` is `shared`.
+
+## Per-strategy settings
+
+Checked-in defaults live in `BUILTIN_STRATEGY_OVERRIDES` in `api/index.py`. That is the source that ships without an env edit. `STRATEGY_OVERRIDES` is optional JSON and replaces individual keys for a strategy; omitted keys keep the built-in value, then the global env. The strategy name must match the alert's `strategy` field exactly. No Vercel variable has to change for `QQQ_EMA_VWAP`.
+
+Overridable keys: `delta_band_min`, `delta_band_max`, `itm_points`, `max_premium`, `tp_percent`, `tp_single`, `stop_loss_percent`, `max_qty`. Caps, expiry, limit fallbacks, hours, and mode are not overridable.
+
+| Strategy | Delta | ITM | Max premium (opens) | Take-profit | Stop | Max qty |
+| --- | --- | --- | --- | --- | --- | --- |
+| `FlowVWAP` (and any other name) | global `0.50`–`0.60` | global `5` | global `MAX_PREMIUM` | global `TP_PERCENT`, `TP_SINGLE` off unless the env says otherwise | global `STOP_LOSS_PERCENT` | global `MAX_QTY` |
+| `QQQ_EMA_VWAP` | `0.60`–`0.75` | `5` | `5.00` | `50%`, `TP_SINGLE` on | off | `1` |
+
+Example, only if a shipped value needs a change (not required):
+
+```json
+{"QQQ_EMA_VWAP": {"max_premium": "6.00", "stop_loss_percent": null}}
+```
+
+Daily caps stay shared on `(day, mode)`, which is how `daily_counters` already works. `MAX_ORDERS_PER_DAY` (3) and `MAX_DAILY_OPENS` (code default 1500; production sets 1000) count FlowVWAP and QQQ together, and so does the exit-order cap. A QQQ open at the $5 premium is $500 of that shared spend budget. Splitting the caps would raise the loss limit, so they stay one pool. Positions do not: each open row is `(underlying, strategy, mode)`.
+
+`MAX_PREMIUM` applies to opens only. A close, flatten, take-profit, or stop is never rejected for being above the cap, for any strategy.
+
+## Read-only preflight
+
+`POST /preflight` takes the same alert JSON and the same passphrase as `/webhook`. It selects the contract with that strategy's settings (`FlowVWAP` uses the global env, `QQQ_EMA_VWAP` uses its profile), then calls Public.com `preflight/single-leg`. The response has `contract`, `premium`, `delta`, and `passed`.
+
+It does not place an order on Public or Alpaca, does not write a position or order row, and does not count toward the daily caps. It ignores the market-hours window, so a check after the close still returns the pick. `/webhook` still rejects outside 09:31–15:55 ET.
 
 ## Take-profit, stop, and flatten
 
@@ -103,7 +134,7 @@ Nick's setup:
 What PAPER does:
 
 - Selection stays on the Public.com chain and greeks. The chosen OCC symbol is sent to Alpaca without space padding, then checked with `GET /v2/options/contracts/{symbol}`. A missing or inactive contract is a 422 and no order is sent.
-- The entry is a buy-to-open limit at the mid (or the ask). On a fill, the relay sells `floor(qty × TP_FRACTION)` at the take-profit and, when `STOP_LOSS_PERCENT` is set, a stop-limit for the filled quantity. Prices use the tick above.
+- The entry is a buy-to-open limit at the mid (or the ask). On a fill, the relay sells `floor(qty × TP_FRACTION)` at the take-profit and, when the strategy's stop is on, a stop-limit for the filled quantity. Prices use the tick above. `QQQ_EMA_VWAP` uses its profile here, including on keepalive.
 - The request polls Alpaca about five times, half a second apart (about 2.5s). If the entry is still working, the position is stored as `PENDING` with `exits_placed` false. `GET /keepalive` and the next alert refresh that fill. Keepalive places the take-profit and stop once the entry is filled. The weekday cron stays `0 13 * * 1-5` UTC, which is before the cash open, so a same-day exit that missed the in-request poll needs a manual keepalive. A later flatten sells whatever has filled and cancels a resting entry that never filled.
 - A flatten cancels resting take-profit and stop orders, then sells the remaining contracts at the mid (or the bid). It does not place those exits and cancel them in the same alert.
 - Positions use `open_positions` with `mode = 'PAPER'`. Daily counters are per mode. In PAPER, exits do not consume `MAX_ORDERS_PER_DAY` even when `EXITS_COUNT_TOWARD_ORDER_CAP=true`. They still use `MAX_EXIT_ORDERS_PER_DAY`.
@@ -115,7 +146,9 @@ What PAPER does:
 
 ## TradingView alert message
 
-Paste this into the strategy alert **Message** box. Replace only the passphrase placeholder. Leave `open_close` off so the relay infers open vs close from `market_position` / `prev_market_position`. `qty` comes from the strategy; partial take-profit stays idle while `MAX_QTY` is 1.
+Paste one object into the strategy alert **Message** box. Replace only the passphrase placeholder. Leave `open_close` off so the relay infers open vs close from `market_position` / `prev_market_position`. `qty` comes from the strategy. FlowVWAP partial take-profit stays idle while `MAX_QTY` is 1. `QQQ_EMA_VWAP` sells its one contract at the 50% take-profit (`TP_SINGLE`).
+
+FlowVWAP, usually on SPY:
 
 ```json
 {
@@ -131,6 +164,22 @@ Paste this into the strategy alert **Message** box. Replace only the passphrase 
 }
 ```
 
+QQQ_EMA_VWAP. The `strategy` value has to be exactly `QQQ_EMA_VWAP` or the relay uses the global FlowVWAP settings.
+
+```json
+{
+  "passphrase": "REPLACE_WITH_WEBHOOK_PASSPHRASE",
+  "symbol": "{{ticker}}",
+  "side": "{{strategy.order.action}}",
+  "qty": "{{strategy.order.contracts}}",
+  "underlying_price": "{{close}}",
+  "market_position": "{{strategy.market_position}}",
+  "prev_market_position": "{{strategy.prev_market_position}}",
+  "strategy": "QQQ_EMA_VWAP",
+  "alert_id": "{{ticker}}-{{strategy.order.id}}-{{timenow}}"
+}
+```
+
 ## 0DTE strategy: QQQ EMA 5/13 with a VWAP filter
 
 `tradingview/qqq_ema_vwap_0dte.pine` is the strategy that came out on top in `research/`. It goes long (call) when EMA(5) is above EMA(13) and the close is above VWAP, goes short (put) when both are below, and goes flat otherwise. It takes at most 3 entries a day, opens nothing at or after 15:30 ET, and flattens at the 15:40 bar close. A flip closes on one bar and enters the other side on the next, because the relay only flattens on a reversal.
@@ -141,18 +190,16 @@ Setup, PAPER first:
 
 1. Chart QQQ on 5-minute bars with extended hours off, and add the Pine script as a strategy.
 2. Create an alert on the strategy with the condition set to order fills only, the webhook URL set to the relay's `/webhook`, and the message from "TradingView alert message" above. Change `"strategy": "FlowVWAP"` to `"strategy": "QQQ_EMA_VWAP"` so its positions are tracked apart from other strategies.
-3. Set these in Vercel and redeploy:
+3. The relay applies these values only for `QQQ_EMA_VWAP`. They are not global env edits.
 
-| Variable | Value | Why |
+| Setting | Value | Why |
 | --- | --- | --- |
-| `ALLOWLIST` | include `QQQ` | Nothing outside the allowlist is traded. |
-| `MODE` | `PAPER` | Rehearse on Alpaca paper for two to three weeks before anything else. |
-| `DELTA_BAND_MIN` / `DELTA_BAND_MAX` | `0.60` / `0.75` | Best band in both periods. `0.50`–`0.60` with TP 50 was a cheaper second choice ($19 per trade held out). |
-| `ITM_POINTS` | `5` | Reaches 0.75 delta on QQQ 0DTE. |
-| `TP_PERCENT` | `50` | 15–20% take-profits gave back most of the edge. |
-| `TP_SINGLE` | `true` | With `MAX_QTY=1` there is no take-profit otherwise. |
-| `STOP_LOSS_PERCENT` | empty | 30% and 50% stops changed little; the signal exit came first. |
-| `MAX_PREMIUM` | `5.00` (default) | Entries ran $1.31–$4.70. $3 would block half of them. |
+| Allowlist | `QQQ` is always allowed | Nothing outside the allowlist is traded. SPY stays on `ALLOWLIST`. |
+| Delta band | `0.60` / `0.75` | Best band in both periods. `0.50`–`0.60` with TP 50 was a cheaper second choice ($19 per trade held out). |
+| ITM points | `5` | Reaches 0.75 delta on QQQ 0DTE. |
+| Take-profit | `50%`, single contract | 15–20% take-profits gave back most of the edge. With max qty 1 there is no take-profit otherwise. |
+| Stop | off | 30% and 50% stops changed little; the signal exit came first. |
+| Max premium | `5.00` on opens | Entries ran $1.31–$4.70. $3 would block half of them. Closes are not capped. |
 
 Per-underlying notes from the same grid: SPY on EMA 5/13 (no VWAP filter) was the runner-up and held up on 14 of 60 contract settings; IWM and XSP did not survive the held-out sessions; SPX premiums ($17 median) are above any sensible cap, so use XSP for S&P exposure.
 
@@ -162,3 +209,5 @@ How the research was done (`research/`, stdlib Python only):
 - `pricing.py` fits a per-timestamp implied-vol smile to real marks for five near-the-money 0DTE contracts per underlying and day, then prices whatever strike the relay would pick. Leave-one-out error against real marks: median $0.02–$0.06.
 - `backtest.py` follows the relay: `choose_leg` ranking, mid-price limit, flatten-only reversals, TP_SINGLE take-profit, stop-limit, the PAPER cutoff and 15:40 flatten, and `MAX_PREMIUM` on opens only. `python research/backtest.py` reruns the grid in a few seconds; `pytest -q research/tests` covers the fill logic.
 - Bands below 0.50 delta need OTM strikes. The relay only picks ATM through `ITM_POINTS` in the money, so those bands were simulated with a 5-point OTM window and would need a relay change to trade.
+
+Those selection and exit values are the checked-in `QQQ_EMA_VWAP` profile. Do not copy them onto the global env: that would change FlowVWAP. `QQQ` is already on the allowlist. Leave `MODE`, `LIVE_CONFIRM`, and the production `MAX_DAILY_OPENS=1000` as they are.

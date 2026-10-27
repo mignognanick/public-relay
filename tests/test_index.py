@@ -892,6 +892,17 @@ def test_underlying_pick_does_not_log_passphrase(tmp_path, caplog):
 def test_settings_defaults_overrides_and_live_gate():
     defaults = relay.Settings.from_env({})
     assert defaults.mode == "PREFLIGHT"
+    assert defaults.allowlist == {"QQQ"}
+    assert defaults.for_strategy("FlowVWAP") is defaults
+    qqq_defaults = defaults.for_strategy("QQQ_EMA_VWAP")
+    assert qqq_defaults.delta_band_min == Decimal("0.60") and qqq_defaults.delta_band_max == Decimal("0.75")
+    assert qqq_defaults.itm_points == Decimal("5") and qqq_defaults.max_premium == Decimal("5.00")
+    assert qqq_defaults.tp_percent == Decimal("50") and qqq_defaults.tp_single is True
+    assert qqq_defaults.stop_loss_percent is None and qqq_defaults.max_qty == 1
+    assert qqq_defaults.max_orders_per_day == defaults.max_orders_per_day
+    assert qqq_defaults.max_daily_opens == defaults.max_daily_opens
+    listed = relay.Settings.from_env({"ALLOWLIST": "spy,AAPL"})
+    assert listed.allowlist == {"SPY", "AAPL", "QQQ"}
     assert defaults.delta_band_min == Decimal("0.50") and defaults.delta_band_max == Decimal("0.60")
     assert defaults.itm_points == Decimal("5") and defaults.expiry_days == 0
     assert defaults.open_limit_fallback == "ask" and defaults.close_limit_fallback == "bid"
@@ -966,6 +977,33 @@ def test_settings_defaults_overrides_and_live_gate():
     with pytest.raises(relay.Reject):
         relay.limit_from_market(None, Decimal("1.37"), "reject")
     assert relay.limit_from_market(Decimal("1.11"), None, "bid") == (Decimal("1.11"), "bid")
+    held = relay.Settings.from_env({"STOP_LOSS_PERCENT": "30", "TP_SINGLE": "true", "MAX_QTY": "4", "TP_PERCENT": "15"})
+    assert held.for_strategy("FlowVWAP").stop_loss_percent == Decimal("30")
+    assert held.for_strategy("FlowVWAP").tp_single is True and held.for_strategy("FlowVWAP").max_qty == 4
+    assert held.for_strategy("FlowVWAP").tp_percent == Decimal("15")
+    qqq_held = held.for_strategy("QQQ_EMA_VWAP")
+    assert qqq_held.stop_loss_percent is None and qqq_held.tp_single is True and qqq_held.max_qty == 1
+    assert qqq_held.tp_percent == Decimal("50")
+    merged = relay.Settings.from_env({
+        "STRATEGY_OVERRIDES": '{"QQQ_EMA_VWAP": {"max_premium": "6.50", "max_qty": 2}, "Other": {"tp_percent": "10"}}',
+        "MAX_PREMIUM": "2.00",
+    })
+    assert merged.for_strategy("QQQ_EMA_VWAP").max_premium == Decimal("6.50")
+    assert merged.for_strategy("QQQ_EMA_VWAP").max_qty == 2
+    assert merged.for_strategy("QQQ_EMA_VWAP").delta_band_min == Decimal("0.60")
+    assert merged.for_strategy("Other").tp_percent == Decimal("10")
+    assert merged.for_strategy("Other").max_premium == Decimal("2.00")
+    assert merged.public_view()["strategies"]["Other"]["tp_percent"] == "10"
+    assert merged.for_strategy("FlowVWAP").max_premium == Decimal("2.00")
+    assert PASS not in json.dumps(merged.public_view())
+    with pytest.raises(ValueError):
+        relay.Settings.from_env({"STRATEGY_OVERRIDES": "[]"})
+    with pytest.raises(ValueError):
+        relay.Settings.from_env({"STRATEGY_OVERRIDES": '{"QQQ_EMA_VWAP": {"nope": 1}}'})
+    with pytest.raises(ValueError):
+        relay.Settings.from_env({"STRATEGY_OVERRIDES": '{"QQQ_EMA_VWAP": {"delta_band_min": "0.90"}}'})
+    with pytest.raises(ValueError):
+        relay.Settings.from_env({"STRATEGY_OVERRIDES": '{"bad name": {"max_qty": 1}}'})
 
 
 def test_health_lists_tunables(tmp_path):
@@ -979,6 +1017,12 @@ def test_health_lists_tunables(tmp_path):
     assert settings["max_premium"] == "5.00" and settings["max_exit_orders_per_day"] == 6
     assert settings["open_limit_fallback"] == "ask" and settings["close_limit_fallback"] == "bid"
     assert settings["stop_loss_percent"] is None and settings["alpaca_configured"] is False
+    assert settings["daily_caps"] == "shared"
+    qqq = settings["strategies"]["QQQ_EMA_VWAP"]
+    assert qqq["delta_band_min"] == "0.60" and qqq["delta_band_max"] == "0.75"
+    assert qqq["itm_points"] == "5" and qqq["max_premium"] == "5.00" and qqq["max_qty"] == 1
+    assert qqq["tp_percent"] == "50" and qqq["tp_single"] is True and qqq["stop_loss_percent"] is None
+    assert "FlowVWAP" not in settings["strategies"]
     assert PASS not in json.dumps(settings) and "secret" not in json.dumps(settings)
     health = c.get("/health").json()
     assert health["mode"] == "PREFLIGHT" and health["alpaca_configured"] is False and "alpaca" not in health
@@ -1514,6 +1558,11 @@ def test_paper_rejects_new_zero_dte_entries_at_the_alpaca_cutoff(tmp_path):
     assert "15:30" in response.json()["error"] and "15:45" in response.json()["error"]
     assert not ending(public, "/option-chain")
     assert broker.posts() == []
+    qqq_late = client.post("/webhook", json=underlying(
+        symbol="QQQ", strategy="QQQ_EMA_VWAP", alert_id="late-qqq"))
+    assert qqq_late.status_code == 422, qqq_late.text
+    assert "15:30" in qqq_late.json()["error"] and "ALLOWLIST" not in qqq_late.json()["error"]
+    assert broker.posts() == []
 
     earlier = datetime(2026, 10, 19, 15, 15, tzinfo=ET)
     aapl, aapl_public, aapl_broker = _paper(tmp_path / "aapl", clock=lambda: earlier)
@@ -1699,3 +1748,340 @@ def test_paper_occ_open_is_placed_and_not_stored(tmp_path):
     assert broker.posts()[0]["position_intent"] == "buy_to_open"
     assert client.sb.positions == {}
     assert not ending(public, "/order")
+
+
+def chain_for(underlying, calls=CALLS, puts=PUTS, yymmdd="261019"):
+    return {
+        "baseSymbol": underlying,
+        "calls": [chain_row(occ(strike, "C", underlying, yymmdd), strike, delta, bid, ask)
+                  for strike, delta, bid, ask in calls],
+        "puts": [chain_row(occ(strike, "P", underlying, yymmdd), strike, delta, bid, ask)
+                 for strike, delta, bid, ask in puts],
+    }
+
+
+def greeks_for(underlying, calls=CALLS, puts=PUTS, yymmdd="261019"):
+    rows = {occ(strike, "C", underlying, yymmdd): delta for strike, delta, _bid, _ask in calls}
+    rows.update({occ(strike, "P", underlying, yymmdd): delta for strike, delta, _bid, _ask in puts})
+    return rows
+
+
+class MultiChainPublic(ChainPublic):
+    """Option chain follows the requested underlying. Greeks and quotes stay one map."""
+
+    def __init__(self, chains, greeks=None, quotes=None):
+        super().__init__(chain=next(iter(chains.values())), greeks=greeks or {}, quotes=quotes)
+        self.chains = chains
+
+    def __call__(self, req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/option-chain"):
+            symbol = json.loads(req.content)["instrument"]["symbol"]
+            self.chain = self.chains[symbol]
+        return super().__call__(req)
+
+
+QQQ_CALL = occ("577", "C", "QQQ")
+
+
+def qqq_alert(**kw):
+    base = underlying(symbol="QQQ", strategy="QQQ_EMA_VWAP", underlying_price="580", alert_id="qqq-1")
+    base.update(kw)
+    return base
+
+
+def two_chains(quotes=None, calls=CALLS):
+    return MultiChainPublic(
+        {"SPY": chain_for("SPY", calls=calls), "QQQ": chain_for("QQQ", calls=calls)},
+        greeks_for("SPY", calls=calls) | greeks_for("QQQ", calls=calls),
+        quotes,
+    )
+
+
+def test_flowvwap_unchanged_and_qqq_uses_its_profile(tmp_path):
+    public = two_chains()
+    client, fake = make(tmp_path, public=public, MAX_QTY="4", MAX_DAILY_OPENS="5000",
+                        STOP_LOSS_PERCENT="30", TP_PERCENT="15", TP_SINGLE="false")
+    spy = client.post("/webhook", json=underlying(alert_id="spy-open"))
+    assert spy.status_code == 200, spy.text
+    spy_body = spy.json()
+    assert spy_body["selection"]["chosen_symbol"] == CHOSEN_CALL
+    assert spy_body["selection"]["chosen_strike"] == "579" and spy_body["selection"]["delta"] == "0.55"
+    assert spy_body["selection"]["limit"] == "1.45"
+    assert spy_body["take_profit"]["attached"] is False
+    assert spy_body["stop"]["attached"] is True and spy_body["stop"]["stop_price"] == "1.02"
+    assert client.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["status"] == "OPEN"
+
+    blocked_qty = client.post("/webhook", json=qqq_alert(alert_id="qqq-qty", qty=2))
+    assert blocked_qty.status_code == 422 and "MAX_QTY" in blocked_qty.json()["error"]
+    assert ("QQQ", "QQQ_EMA_VWAP", "PREFLIGHT") not in client.sb.positions
+
+    qqq = client.post("/webhook", json=qqq_alert())
+    assert qqq.status_code == 200, qqq.text
+    body = qqq.json()
+    assert body["selection"]["chosen_symbol"] == QQQ_CALL
+    assert body["selection"]["chosen_strike"] == "577" and body["selection"]["delta"] == "0.66"
+    assert body["selection"]["limit"] == "3.30"
+    assert Decimal(body["selection"]["limit"]) > Decimal("2.00")
+    take_profit = body["take_profit"]
+    assert take_profit["attached"] is True and take_profit["quantity"] == 1 and take_profit["limit_price"] == "4.95"
+    assert body["stop"]["attached"] is False and body["stop"]["reason"] == "STOP_LOSS_PERCENT is not set"
+    saved = client.sb.positions[("QQQ", "QQQ_EMA_VWAP", "PREFLIGHT")]
+    assert saved["status"] == "OPEN" and saved["symbol"] == QQQ_CALL and saved["tp_status"] == "RESTING"
+    assert saved["stop_status"] == "NONE"
+    assert client.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["status"] == "OPEN"
+    assert not ending(fake, "/order")
+
+    missing = client.post("/webhook", json=underlying(symbol="IWM", strategy="QQQ_EMA_VWAP", alert_id="iwm"))
+    assert missing.status_code == 422 and "ALLOWLIST" in missing.json()["error"]
+
+
+def test_flatten_stays_on_its_ticker_and_strategy(tmp_path):
+    quotes = {
+        CHOSEN_CALL: option_quote(CHOSEN_CALL, "1.10", "1.30"),
+        QQQ_CALL: option_quote(QQQ_CALL, "3.00", "3.40"),
+    }
+    client, fake = make(tmp_path, public=two_chains(quotes), MAX_DAILY_OPENS="5000", MAX_ORDERS_PER_DAY="10")
+    assert client.post("/webhook", json=underlying(alert_id="spy-open")).status_code == 200
+    opened = client.post("/webhook", json=qqq_alert())
+    assert opened.status_code == 200, opened.text
+
+    wrong_strategy = client.post("/webhook", json=underlying(
+        symbol="QQQ", strategy="FlowVWAP", side="sell", market_position="flat",
+        prev_market_position="long", alert_id="qqq-as-flow", qty=99))
+    assert wrong_strategy.status_code == 422 and "no open position" in wrong_strategy.json()["error"]
+    wrong_ticker = client.post("/webhook", json=qqq_alert(
+        symbol="SPY", side="sell", market_position="flat", prev_market_position="long",
+        alert_id="spy-as-qqq", qty=99))
+    assert wrong_ticker.status_code == 422 and "no open position" in wrong_ticker.json()["error"]
+    assert client.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["status"] == "OPEN"
+    assert client.sb.positions[("QQQ", "QQQ_EMA_VWAP", "PREFLIGHT")]["status"] == "OPEN"
+
+    flat_qqq = client.post("/webhook", json=qqq_alert(
+        side="sell", market_position="flat", prev_market_position="long", alert_id="qqq-flat", qty=99))
+    assert flat_qqq.status_code == 200, flat_qqq.text
+    assert flat_qqq.json()["selection"]["chosen_symbol"] == QQQ_CALL
+    assert flat_qqq.json()["order"]["quantity"] == "1" and flat_qqq.json()["order"]["openCloseIndicator"] == "CLOSE"
+    assert client.sb.positions[("QQQ", "QQQ_EMA_VWAP", "PREFLIGHT")]["status"] == "CLOSED"
+    assert client.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["status"] == "OPEN"
+    assert client.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["symbol"] == CHOSEN_CALL
+
+    flat_spy = client.post("/webhook", json=flatten_alert("spy-flat"))
+    assert flat_spy.status_code == 200, flat_spy.text
+    assert flat_spy.json()["selection"]["chosen_symbol"] == CHOSEN_CALL
+    assert client.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["status"] == "CLOSED"
+    assert client.sb.positions[("QQQ", "QQQ_EMA_VWAP", "PREFLIGHT")]["status"] == "CLOSED"
+    assert not ending(fake, "/order")
+
+
+def test_premium_cap_never_blocks_a_close(tmp_path):
+    # Global cap is pinned at 2.00 so FlowVWAP and the QQQ profile differ. The code default is 5.00.
+    client, _fake = make(tmp_path, MAX_PREMIUM="2.00", MAX_DAILY_OPENS="5000", MAX_ORDERS_PER_DAY="10")
+    opened = client.post("/webhook", json=alert(
+        symbol="QQQ261120C00480000", limit_price="5.00", strategy="QQQ_EMA_VWAP", alert_id="q-open"))
+    assert opened.status_code == 200, opened.text
+    rich = client.post("/webhook", json=alert(
+        symbol="QQQ261120C00480000", limit_price="5.01", strategy="QQQ_EMA_VWAP", alert_id="q-rich"))
+    assert rich.status_code == 422 and "MAX_PREMIUM" in rich.json()["error"]
+    spy_rich = client.post("/webhook", json=alert(
+        symbol="SPY261120C00480000", limit_price="2.01", strategy="FlowVWAP", alert_id="spy-rich"))
+    assert spy_rich.status_code == 422 and "MAX_PREMIUM" in spy_rich.json()["error"]
+    qqq_close = client.post("/webhook", json=alert(
+        symbol="QQQ261120C00480000", side="SELL", open_close="CLOSE", limit_price="9.00",
+        strategy="QQQ_EMA_VWAP", alert_id="q-close"))
+    assert qqq_close.status_code == 200, qqq_close.text
+    assert qqq_close.json()["order_placed"] is False
+    spy_close = client.post("/webhook", json=alert(
+        symbol="SPY261120C00480000", side="SELL", open_close="CLOSE", limit_price="9.00",
+        strategy="FlowVWAP", alert_id="spy-close"))
+    assert spy_close.status_code == 200, spy_close.text
+
+    quotes = {QQQ_CALL: option_quote(QQQ_CALL, "8.80", "9.20")}
+    chained, _fake = make(tmp_path / "chain", public=two_chains(quotes), MAX_PREMIUM="2.00",
+                          MAX_DAILY_OPENS="5000")
+    assert chained.post("/webhook", json=qqq_alert(alert_id="qqq-open")).status_code == 200
+    flat = chained.post("/webhook", json=qqq_alert(
+        side="sell", market_position="flat", prev_market_position="long", alert_id="qqq-flat", qty=99))
+    assert flat.status_code == 200, flat.text
+    assert flat.json()["selection"]["limit"] == "9.00"
+    assert Decimal(flat.json()["selection"]["limit"]) > Decimal("5.00")
+    assert chained.sb.positions[("QQQ", "QQQ_EMA_VWAP", "PREFLIGHT")]["status"] == "CLOSED"
+
+
+def test_daily_caps_stay_shared_across_strategies(tmp_path):
+    public = two_chains()
+    client, _fake = make(tmp_path, public=public, MAX_ORDERS_PER_DAY="2", MAX_DAILY_OPENS="5000")
+    assert client.post("/webhook", json=underlying(alert_id="spy-1")).status_code == 200
+    assert client.post("/webhook", json=qqq_alert(alert_id="qqq-1")).status_code == 200
+    third = client.post("/webhook", json=underlying(alert_id="extra", strategy="Extra"))
+    assert third.status_code == 422 and "MAX_ORDERS_PER_DAY" in third.json()["error"]
+    assert client.sb.counters[("2026-10-19", "PREFLIGHT")][0] == 2
+    assert ("SPY", "Extra", "PREFLIGHT") not in client.sb.positions
+    assert client.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["status"] == "OPEN"
+    assert client.sb.positions[("QQQ", "QQQ_EMA_VWAP", "PREFLIGHT")]["status"] == "OPEN"
+
+    spend, _fake = make(tmp_path / "spend", public=two_chains(), MAX_DAILY_OPENS="200", MAX_ORDERS_PER_DAY="10")
+    assert spend.post("/webhook", json=underlying(alert_id="spy-spend")).status_code == 200
+    blocked = spend.post("/webhook", json=qqq_alert(alert_id="qqq-spend"))
+    assert blocked.status_code == 422 and "spend cap" in blocked.json()["error"]
+    assert spend.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["status"] == "OPEN"
+    assert ("QQQ", "QQQ_EMA_VWAP", "PREFLIGHT") not in spend.sb.positions
+    assert spend.sb.counters[("2026-10-19", "PREFLIGHT")][1] == Decimal("145.00")
+
+
+def test_paper_qqq_profile_and_close_ignores_the_premium_cap(tmp_path):
+    quotes = {
+        CHOSEN_CALL: option_quote(CHOSEN_CALL, "8.00", "8.40"),
+        QQQ_CALL: option_quote(QQQ_CALL, "9.00", "9.40"),
+    }
+    broker = FakeAlpaca()
+    client, public = make(
+        tmp_path, mode="PAPER", public=two_chains(quotes), alpaca=broker,
+        MAX_DAILY_OPENS="5000", MAX_ORDERS_PER_DAY="10", STOP_LOSS_PERCENT="30", MAX_QTY="4")
+    spy = client.post("/webhook", json=underlying(alert_id="spy-paper"))
+    assert spy.status_code == 200, spy.text
+    assert spy.json()["take_profit"]["attached"] is False
+    assert spy.json()["stop"]["attached"] is True and spy.json()["stop"]["stop_price"] == "1.02"
+    qqq = client.post("/webhook", json=qqq_alert(alert_id="qqq-paper"))
+    assert qqq.status_code == 200, qqq.text
+    body = qqq.json()
+    assert body["order_placed"] is True and body["broker"] == "alpaca"
+    assert body["selection"]["chosen_symbol"] == QQQ_CALL and body["selection"]["limit"] == "3.30"
+    assert body["take_profit"]["attached"] is True and body["take_profit"]["limit_price"] == "4.95"
+    assert body["stop"]["attached"] is False
+    entry_limits = [order["limit_price"] for order in broker.posts() if order["position_intent"] == "buy_to_open"]
+    assert entry_limits == ["1.45", "3.30"]
+    qqq_exit = [order for order in broker.posts() if order["symbol"] == QQQ_CALL and order["side"] == "sell"]
+    assert len(qqq_exit) == 1 and qqq_exit[0]["type"] == "limit" and qqq_exit[0]["limit_price"] == "4.95"
+    assert not any(order["symbol"] == QQQ_CALL and order["type"] == "stop_limit" for order in broker.posts())
+
+    flat = client.post("/webhook", json=qqq_alert(
+        side="sell", market_position="flat", prev_market_position="long", alert_id="qqq-flat", qty=99))
+    assert flat.status_code == 200, flat.text
+    assert flat.json()["order_placed"] is True and flat.json()["order"]["limit_price"] == "9.20"
+    assert Decimal(flat.json()["order"]["limit_price"]) > Decimal("5")
+    assert client.sb.positions[("QQQ", "QQQ_EMA_VWAP", "PAPER")]["status"] == "CLOSED"
+    assert client.sb.positions[("SPY", "FlowVWAP", "PAPER")]["status"] == "OPEN"
+
+    spy_flat = client.post("/webhook", json=flatten_alert("spy-paper-flat"))
+    assert spy_flat.status_code == 200, spy_flat.text
+    assert spy_flat.json()["order"]["limit_price"] == "8.20"
+    assert client.sb.positions[("SPY", "FlowVWAP", "PAPER")]["status"] == "CLOSED"
+    assert not ending(public, "/order")
+    blob = flat.text + spy_flat.text
+    assert "alpaca-secret" not in blob and "alpaca-key" not in blob and PASS not in blob
+
+
+def test_paper_keepalive_uses_the_qqq_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("CRON_SECRET", "cron-s")
+    broker = FakeAlpaca(entry_status="new")
+    client, _public = make(
+        tmp_path, mode="PAPER", public=two_chains(), alpaca=broker,
+        MAX_DAILY_OPENS="5000", STOP_LOSS_PERCENT="30", TP_PERCENT="15")
+    opened = client.post("/webhook", json=qqq_alert(alert_id="qqq-wait"))
+    assert opened.status_code == 200, opened.text
+    assert opened.json()["entry_status"] == "PENDING" and opened.json()["take_profit"]["attached"] is False
+    assert opened.json()["stop"]["reason"] == "STOP_LOSS_PERCENT is not set"
+    order = broker.orders[opened.json()["alpaca_order_id"]]
+    order["status"] = "filled"
+    order["filled_qty"] = "1"
+    order["filled_avg_price"] = "3.30"
+    kept = client.get("/keepalive", headers={"Authorization": "Bearer cron-s"})
+    assert kept.status_code == 200, kept.text
+    sells = [post for post in broker.posts() if post["side"] == "sell"]
+    assert len(sells) == 1
+    assert sells[0]["type"] == "limit" and sells[0]["limit_price"] == "4.95" and sells[0]["symbol"] == QQQ_CALL
+    saved = client.sb.positions[("QQQ", "QQQ_EMA_VWAP", "PAPER")]
+    assert saved["tp_limit"] == "4.95" and saved["stop_status"] == "NONE" and saved["exits_placed"] is True
+    assert "alpaca-secret" not in kept.text
+
+
+def _write_paths(client):
+    return [call.url.path for call in client.sb.calls
+            if not call.url.path.endswith("relay_get_position")]
+
+
+def test_preflight_selects_without_orders_caps_or_positions(tmp_path):
+    public = two_chains()
+    client, fake = make(tmp_path, public=public, MAX_PREMIUM="2.00", MAX_DAILY_OPENS="5000")
+    denied = client.post("/preflight", json=underlying(passphrase="wrong", alert_id="nope"))
+    assert denied.status_code == 401
+    assert fake.calls == [] and client.sb.calls == []
+
+    spy = client.post("/preflight", json=underlying())
+    assert spy.status_code == 200, spy.text
+    body = spy.json()
+    assert body["passed"] is True and body["order_placed"] is False
+    assert body["contract"] == CHOSEN_CALL and body["premium"] == "1.45" and body["delta"] == "0.55"
+    assert len(ending(fake, "/preflight/single-leg")) == 1
+    assert not ending(fake, "/order")
+    assert client.sb.positions == {} and client.sb.counters == {} and client.sb.picks == []
+    assert client.sb.alerts == {} and _write_paths(client) == []
+
+    qqq = client.post("/preflight", json=qqq_alert())
+    assert qqq.status_code == 200, qqq.text
+    picked = qqq.json()
+    assert picked["passed"] is True and picked["order_placed"] is False
+    assert picked["contract"] == QQQ_CALL and picked["premium"] == "3.30" and picked["delta"] == "0.66"
+    assert Decimal(picked["premium"]) > Decimal("2.00")
+    assert not ending(fake, "/order")
+    assert client.sb.positions == {} and client.sb.counters == {} and client.sb.alerts == {}
+    assert _write_paths(client) == []
+
+    closed = client.post("/preflight", json=alert(
+        symbol="QQQ261120C00480000", side="SELL", open_close="CLOSE", limit_price="9.00",
+        strategy="QQQ_EMA_VWAP", alert_id="q-close-preview"))
+    assert closed.status_code == 200, closed.text
+    assert closed.json()["passed"] is True and closed.json()["premium"] == "9.00" and closed.json()["order_placed"] is False
+    assert not ending(fake, "/order")
+    assert client.sb.positions == {} and client.sb.counters == {}
+
+    # The same check does not use up an entry, so the real webhook can still open.
+    opened = client.post("/webhook", json=underlying(alert_id="after-preview"))
+    assert opened.status_code == 200, opened.text
+    assert client.sb.counters[("2026-10-19", "PREFLIGHT")][0] == 1
+    assert not ending(fake, "/order")
+
+
+def test_preflight_works_outside_market_hours_and_places_nothing_on_paper(tmp_path):
+    late = datetime(2026, 10, 19, 15, 56, tzinfo=ET)
+    public = ChainPublic()
+    client, fake = make(tmp_path, public=public, clock=lambda: late)
+    preview = client.post("/preflight", json=underlying(alert_id="late-preview"))
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["passed"] is True and preview.json()["contract"] == CHOSEN_CALL
+    assert preview.json()["order_placed"] is False
+    assert not ending(fake, "/order")
+    assert client.sb.positions == {} and client.sb.counters == {} and client.sb.alerts == {}
+    webhook = client.post("/webhook", json=underlying(alert_id="late-webhook"))
+    assert webhook.status_code == 422 and "window" in webhook.json()["error"]
+    assert not ending(fake, "/order")
+
+    broker = FakeAlpaca()
+    paper, paper_public = make(
+        tmp_path / "paper", mode="PAPER", public=two_chains(), alpaca=broker, MAX_DAILY_OPENS="5000")
+    qqq = paper.post("/preflight", json=qqq_alert(alert_id="paper-preview"))
+    assert qqq.status_code == 200, qqq.text
+    assert qqq.json()["contract"] == QQQ_CALL and qqq.json()["premium"] == "3.30" and qqq.json()["passed"] is True
+    assert broker.posts() == [] and broker.calls == []
+    assert not ending(paper_public, "/order")
+    assert paper.sb.positions == {} and paper.sb.counters == {} and paper.sb.alerts == {}
+    assert _write_paths(paper) == []
+    assert "alpaca-secret" not in qqq.text and PASS not in qqq.text
+
+
+def test_preflight_failure_still_places_nothing(tmp_path):
+    class BadPreflight(ChainPublic):
+        def __call__(self, req):
+            if req.url.path.endswith("/preflight/single-leg"):
+                self.calls.append(req)
+                return httpx.Response(400, json={"error": "nope"})
+            return super().__call__(req)
+
+    client, fake = make(tmp_path, public=BadPreflight())
+    preview = client.post("/preflight", json=underlying(alert_id="bad-preview"))
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["passed"] is False and preview.json()["preflight_status"] == 400
+    assert preview.json()["contract"] == CHOSEN_CALL and preview.json()["order_placed"] is False
+    assert not ending(fake, "/order")
+    assert client.sb.positions == {} and client.sb.counters == {} and client.sb.alerts == {}
+    assert _write_paths(client) == []
