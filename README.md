@@ -130,3 +130,35 @@ Paste this into the strategy alert **Message** box. Replace only the passphrase 
   "alert_id": "{{ticker}}-{{strategy.order.id}}-{{timenow}}"
 }
 ```
+
+## 0DTE strategy: QQQ EMA 5/13 with a VWAP filter
+
+`tradingview/qqq_ema_vwap_0dte.pine` is the strategy that came out on top in `research/`. It goes long (call) when EMA(5) is above EMA(13) and the close is above VWAP, goes short (put) when both are below, and goes flat otherwise. It takes at most 3 entries a day, opens nothing at or after 15:30 ET, and flattens at the 15:40 bar close. A flip closes on one bar and enters the other side on the next, because the relay only flattens on a reversal.
+
+Backtest, Sep 28 – Oct 26, 2026 (21 sessions, 1 contract, after modeled costs, $5 cap): 58 trades, 50% wins, $38.90 average per trade, profit factor 2.17, max drawdown $448. Ranking used Sep 28 – Oct 16; the held-out Oct 19 – Oct 26 sessions made $35.40 per trade (15 trades, profit factor 1.76). Fifteen held-out trades is a small sample, and the winner was picked from 135 symbol and signal pairs, so expect less live. Full results: `research/results/summary.json`.
+
+Setup, PAPER first:
+
+1. Chart QQQ on 5-minute bars with extended hours off, and add the Pine script as a strategy.
+2. Create an alert on the strategy with the condition set to order fills only, the webhook URL set to the relay's `/webhook`, and the message from "TradingView alert message" above. Change `"strategy": "FlowVWAP"` to `"strategy": "QQQ_EMA_VWAP"` so its positions are tracked apart from other strategies.
+3. Set these in Vercel and redeploy:
+
+| Variable | Value | Why |
+| --- | --- | --- |
+| `ALLOWLIST` | include `QQQ` | Nothing outside the allowlist is traded. |
+| `MODE` | `PAPER` | Rehearse on Alpaca paper for two to three weeks before anything else. |
+| `DELTA_BAND_MIN` / `DELTA_BAND_MAX` | `0.60` / `0.75` | Best band in both periods. `0.50`–`0.60` with TP 50 was a cheaper second choice ($19 per trade held out). |
+| `ITM_POINTS` | `5` | Reaches 0.75 delta on QQQ 0DTE. |
+| `TP_PERCENT` | `50` | 15–20% take-profits gave back most of the edge. |
+| `TP_SINGLE` | `true` | With `MAX_QTY=1` there is no take-profit otherwise. |
+| `STOP_LOSS_PERCENT` | empty | 30% and 50% stops changed little; the signal exit came first. |
+| `MAX_PREMIUM` | `5.00` (default) | Entries ran $1.31–$4.70. $3 would block half of them. |
+
+Per-underlying notes from the same grid: SPY on EMA 5/13 (no VWAP filter) was the runner-up and held up on 14 of 60 contract settings; IWM and XSP did not survive the held-out sessions; SPX premiums ($17 median) are above any sensible cap, so use XSP for S&P exposure.
+
+How the research was done (`research/`, stdlib Python only):
+
+- Data came from the Robinhood MCP (`get_equity_historicals`, `get_index_historicals`, `get_option_instruments` with `state=expired`, `get_option_historicals`). The plan called for the Alpaca MCP, but its sign-in timed out, and Robinhood serves expired 0DTE contracts. `fetch_data.py` prints the calls still needed and ingests the saved responses into `research/data/` (git-ignored).
+- `pricing.py` fits a per-timestamp implied-vol smile to real marks for five near-the-money 0DTE contracts per underlying and day, then prices whatever strike the relay would pick. Leave-one-out error against real marks: median $0.02–$0.06.
+- `backtest.py` follows the relay: `choose_leg` ranking, mid-price limit, flatten-only reversals, TP_SINGLE take-profit, stop-limit, the PAPER cutoff and 15:40 flatten, and `MAX_PREMIUM` on opens only. `python research/backtest.py` reruns the grid in a few seconds; `pytest -q research/tests` covers the fill logic.
+- Bands below 0.50 delta need OTM strikes. The relay only picks ATM through `ITM_POINTS` in the money, so those bands were simulated with a 5-point OTM window and would need a relay change to trade.
