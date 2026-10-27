@@ -4,3 +4,4 @@ __pycache__/
 .env
 *.py[cod]
 research/data/
+research/results/stage*.json

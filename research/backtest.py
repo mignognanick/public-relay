@@ -36,15 +36,19 @@ COST = {"SPY": 0.02, "QQQ": 0.03, "IWM": 0.02, "XSP": 0.05, "SPX": 0.30}
 COST_PCT = 0.01
 MULTIPLIER = 100
 PREMIUM_CAPS = (3.0, 5.0, 8.0, None)
-MIN_TRADES_IN_SAMPLE = 15
+MIN_TRADES_IN_SAMPLE = 30
+MIN_PROFIT_FACTOR_OUT = 1.2
 
 
 def cutoff(symbol: str) -> time:
     return time(15, 30) if symbol in ("SPY", "QQQ") else time(15, 15)
 
 
+STRESS = {"tp_on_extreme": True, "cost_multiplier": 1.0}
+
+
 def cost(symbol: str, premium: float) -> float:
-    return max(COST[symbol], COST_PCT * premium)
+    return STRESS["cost_multiplier"] * max(COST[symbol], COST_PCT * premium)
 
 
 @dataclass(frozen=True)
@@ -160,7 +164,8 @@ def _resting_exit(symbol: str, day: str, leg: Leg, bar: Bar) -> Trade | None:
             leg.trade.reason = "stop"
             return leg.trade
     if leg.tp_limit is not None:
-        high_mark = pricing.mark(symbol, day, bar.end, favorable, strike, leg.right)
+        touch = favorable if STRESS["tp_on_extreme"] else bar.c
+        high_mark = pricing.mark(symbol, day, bar.end, touch, strike, leg.right)
         if high_mark >= leg.tp_limit + cost(symbol, leg.tp_limit):
             leg.trade.exit = leg.tp_limit
             leg.trade.exit_time = bar.end.strftime("%H:%M")
@@ -293,6 +298,12 @@ def score(r: Result) -> float:
     return m["avg_pnl"] * min(1.0, m["total_pnl"] / max(m["max_drawdown"], 1.0) / 2)
 
 
+def confirmed(r: Result) -> bool:
+    """Ranked on the in-sample sessions, kept only if the held-out sessions agree."""
+    o = r.out_sample
+    return score(r) > -1e9 and o["avg_pnl"] > 0 and o["profit_factor"] >= MIN_PROFIT_FACTOR_OUT
+
+
 def run() -> dict:
     RESULTS.mkdir(exist_ok=True)
     default = ContractCfg()
@@ -338,16 +349,48 @@ def run() -> dict:
             trade_log[f"{sym}|{name}|{cfg.name}"] = [asdict(t) | {"pnl": round(t.pnl, 2)}
                                                     for t in apply_cap(trades, 5.0)]
     stage2.sort(key=score, reverse=True)
-    winner = stage2[0] if stage2 and score(stage2[0]) > -1e9 else None
+    winner = next((r for r in stage2 if confirmed(r)), None)
 
-    premium_by_cap = [asdict(r) for r in stage1 if r.variant == (winner.variant if winner else "")
-                      and r.symbol == (winner.symbol if winner else "")]
+    robustness = []
+    for sym, name in finalists:
+        rows = [r for r in stage2 if r.symbol == sym and r.variant == name]
+        robustness.append({
+            "symbol": sym, "variant": name, "configs": len(rows),
+            "in_positive": sum(r.in_sample["avg_pnl"] > 0 for r in rows),
+            "out_positive": sum(r.out_sample["avg_pnl"] > 0 for r in rows),
+            "both_positive": sum(r.in_sample["avg_pnl"] > 0 and r.out_sample["avg_pnl"] > 0 for r in rows),
+            "confirmed": sum(confirmed(r) for r in rows),
+        })
+
+    winner_caps, stress = [], []
+    if winner is not None:
+        v, cfg = by_name[winner.variant], next(c for c in contract_grid() if c.name == winner.contract)
+        sym = winner.symbol
+        days_in, days_out = sessions(sym)
+
+        def sim() -> list[Trade]:
+            return simulate(sym, v, cfg, signal_cache[SIGNAL_SOURCE[sym]], spot_cache[sym], targets(sym, v))
+
+        base = sim()
+        winner_caps = [asdict(evaluate(sym, v, cfg, base, cap, days_in, days_out)) for cap in PREMIUM_CAPS]
+        for label, patch in (("take-profit fills on bar close only", {"tp_on_extreme": False}),
+                             ("double costs", {"cost_multiplier": 2.0}),
+                             ("both", {"tp_on_extreme": False, "cost_multiplier": 2.0})):
+            saved = dict(STRESS)
+            STRESS.update(patch)
+            try:
+                stress.append({"label": label} | asdict(evaluate(sym, v, cfg, sim(), 5.0, days_in, days_out)))
+            finally:
+                STRESS.update(saved)
     summary = {
         "winner": asdict(winner) if winner else None,
         "winner_trades": trade_log.get(f"{winner.symbol}|{winner.variant}|{winner.contract}", []) if winner else [],
         "finalists": [{"symbol": s, "variant": n} for s, n in finalists],
+        "robustness": robustness,
+        "signal_ranking": [asdict(r) | {"score": round(score(r), 2)} for r in capped[:30]],
         "stage2_top": [asdict(r) | {"score": round(score(r), 2)} for r in stage2[:40]],
-        "winner_caps": premium_by_cap,
+        "winner_caps": winner_caps,
+        "stress": stress,
         "validation": [pricing.validate(s) for s in ("SPY", "QQQ", "IWM")],
     }
     (RESULTS / "stage1.json").write_text(json.dumps([asdict(r) | {"score": round(score(r), 2)} for r in stage1], indent=1))
