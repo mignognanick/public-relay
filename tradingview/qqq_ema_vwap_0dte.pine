@@ -1,0 +1,65 @@
+//@version=6
+// QQQ 0DTE: EMA 5/13 trend with a VWAP filter, sent to the public-relay webhook.
+// Backtest and settings: research/results/summary.json and README "0DTE strategy".
+//
+// Chart: QQQ, 5-minute, regular trading hours only (extended hours off). EMA and VWAP were
+// tested on 09:30-16:00 ET bars; pre-market bars change both.
+//
+// Each order fill sends one alert. Use the README alert message (underlying_template).
+// - Long entry  -> BUY,  flat -> long  : relay opens a 0DTE call
+// - Short entry -> SELL, flat -> short : relay opens a 0DTE put
+// - Any exit    -> market_position flat: relay flattens
+// A flip closes on one bar and enters the other side on the next bar, because the relay only
+// flattens on a reversal and does not open the other side from the same alert.
+//
+// Relay settings this was tuned with: DELTA_BAND_MIN=0.60, DELTA_BAND_MAX=0.75, ITM_POINTS=5,
+// TP_PERCENT=50, TP_SINGLE=true, STOP_LOSS_PERCENT empty, MAX_PREMIUM=5.00, MAX_QTY=1.
+strategy("QQQ 0DTE EMA 5/13 + VWAP (relay)", overlay = true, process_orders_on_close = true, default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0)
+
+fastLen     = input.int(5, "Fast EMA", minval = 1)
+slowLen     = input.int(13, "Slow EMA", minval = 2)
+useVwap     = input.bool(true, "Require close on the trend side of VWAP", tooltip = "Off: long whenever fast > slow, short otherwise.")
+maxEntries  = input.int(3, "Max entries per day", minval = 1, tooltip = "Matches the relay default MAX_ORDERS_PER_DAY=3.")
+cutoffHHMM  = input.int(1530, "No new entries at or after (ET, HHMM)", tooltip = "Relay PAPER cutoff: 1530 for SPY/QQQ, 1515 for anything else.")
+flattenHHMM = input.int(1540, "Flatten at bar close (ET, HHMM)", tooltip = "Alpaca auto-liquidates 0DTE at 15:45 ET.")
+
+tz = "America/New_York"
+
+fast = ta.ema(close, fastLen)
+slow = ta.ema(close, slowLen)
+vw   = ta.vwap(hlc3)
+up   = fast > slow
+
+// +1 wants a call, -1 wants a put, 0 wants flat.
+int target = useVwap ? (up and close > vw ? 1 : not up and close < vw ? -1 : 0) : (up ? 1 : -1)
+
+barEnd = hour(time_close, tz) * 100 + minute(time_close, tz)
+
+var int entries = 0
+var int pos     = 0
+
+if timeframe.change("D")
+    entries := 0
+    if pos != 0
+        strategy.close_all(comment = "new day")
+        pos := 0
+
+if barEnd >= flattenHHMM
+    if pos != 0
+        strategy.close_all(comment = "flatten")
+        pos := 0
+else if pos != 0 and target != pos
+    strategy.close(pos == 1 ? "Call" : "Put", comment = "exit")
+    pos := 0
+else if pos == 0 and target != 0 and barEnd < cutoffHHMM and entries < maxEntries
+    if target == 1
+        strategy.entry("Call", strategy.long)
+    else
+        strategy.entry("Put", strategy.short)
+    pos := target
+    entries += 1
+
+plot(fast, "Fast EMA", color = color.new(color.teal, 0))
+plot(slow, "Slow EMA", color = color.new(color.orange, 0))
+plot(vw, "VWAP", color = color.new(color.gray, 0), linewidth = 2)
+bgcolor(barEnd >= cutoffHHMM ? color.new(color.gray, 90) : na, title = "No new entries")

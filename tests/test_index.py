@@ -313,9 +313,27 @@ def test_qty_cap(tmp_path):
 
 def test_premium_cap(tmp_path):
     c, fake = make(tmp_path)
-    r = c.post("/webhook", json=alert(limit_price="2.01"))
+    r = c.post("/webhook", json=alert(limit_price="5.01"))
     assert r.status_code == 422 and "MAX_PREMIUM" in r.json()["error"]
     assert fake.calls == []
+    assert c.post("/webhook", json=alert(limit_price="5.00", alert_id="at-cap")).status_code == 200
+
+
+def test_premium_cap_skips_closes(tmp_path):
+    c, fake = make(tmp_path, MAX_PREMIUM="2.00")
+    opened = c.post("/webhook", json=alert(limit_price="2.01", alert_id="open"))
+    assert opened.status_code == 422 and "MAX_PREMIUM" in opened.json()["error"]
+    closed = c.post("/webhook", json=alert(side="SELL", open_close="CLOSE", limit_price="7.50", alert_id="close"))
+    assert closed.status_code == 200, closed.text
+    assert fake.calls
+
+
+def test_validate_caps_opens_only():
+    s = relay.Settings.from_env({"MAX_PREMIUM": "2.00", "ALLOWLIST": "AAPL"})
+    base = {"symbol": "AAPL261120C00250000", "limit_price": "9.00", "qty": 1}
+    with pytest.raises(relay.Reject, match="MAX_PREMIUM"):
+        relay.validate(base | {"side": "BUY", "open_close": "OPEN"}, s)
+    assert relay.validate(base | {"side": "SELL", "open_close": "CLOSE"}, s)["limit_price"] == Decimal("9.00")
 
 
 def test_preflight_mode_never_calls_order(tmp_path):
@@ -793,7 +811,7 @@ def test_underlying_keeps_safety_checks(tmp_path, capsys):
     assert late.status_code == 422 and "window" in late.json()["error"]
     assert fake_late.calls == []
 
-    rich = [("579", "0.55", "2.00", "2.20")]
+    rich = [("579", "0.55", "5.00", "5.40")]
     c_px, fake_px = make(tmp_path / "px", public=ChainPublic(chain=spy_chain(calls=rich, puts=[]),
                                                              greeks=greek_map(rich, "C")))
     priced = c_px.post("/webhook", json=underlying(alert_id="rich"))
@@ -802,7 +820,7 @@ def test_underlying_keeps_safety_checks(tmp_path, capsys):
     assert c_px.sb.picks and not c_px.sb.positions
     assert not ending(fake_px, "/preflight/single-leg") and not ending(fake_px, "/order")
 
-    c_cap, _ = make(tmp_path / "cap", public=ChainPublic())
+    c_cap, _ = make(tmp_path / "cap", public=ChainPublic(), MAX_DAILY_OPENS="300")
     assert c_cap.post("/webhook", json=underlying(alert_id="a", strategy="A")).status_code == 200  # $145
     assert c_cap.post("/webhook", json=underlying(alert_id="b", strategy="B")).status_code == 200  # $290
     third = c_cap.post("/webhook", json=underlying(alert_id="c", strategy="C"))
@@ -877,8 +895,8 @@ def test_settings_defaults_overrides_and_live_gate():
     assert defaults.delta_band_min == Decimal("0.50") and defaults.delta_band_max == Decimal("0.60")
     assert defaults.itm_points == Decimal("5") and defaults.expiry_days == 0
     assert defaults.open_limit_fallback == "ask" and defaults.close_limit_fallback == "bid"
-    assert defaults.max_orders_per_day == 3 and defaults.max_daily_opens == Decimal("300")
-    assert defaults.max_premium == Decimal("2.00")
+    assert defaults.max_orders_per_day == 3 and defaults.max_daily_opens == Decimal("1500")
+    assert defaults.max_premium == Decimal("5.00")
     assert defaults.tp_percent == Decimal("20") and defaults.tp_fraction == Decimal("0.50")
     assert defaults.tp_single is False and defaults.stop_loss_percent is None
     assert defaults.exits_count_toward_order_cap is False
@@ -957,8 +975,8 @@ def test_health_lists_tunables(tmp_path):
     assert settings["itm_points"] == "5" and settings["expiry_days"] == 3
     assert settings["tp_percent"] == "15" and settings["tp_fraction"] == "0.50"
     assert settings["tp_single"] is False and settings["exits_count_toward_order_cap"] is False
-    assert settings["max_orders_per_day"] == 3 and settings["max_daily_opens"] == "300"
-    assert settings["max_premium"] == "2.00" and settings["max_exit_orders_per_day"] == 6
+    assert settings["max_orders_per_day"] == 3 and settings["max_daily_opens"] == "1500"
+    assert settings["max_premium"] == "5.00" and settings["max_exit_orders_per_day"] == 6
     assert settings["open_limit_fallback"] == "ask" and settings["close_limit_fallback"] == "bid"
     assert settings["stop_loss_percent"] is None and settings["alpaca_configured"] is False
     assert PASS not in json.dumps(settings) and "secret" not in json.dumps(settings)

@@ -138,9 +138,9 @@ class Settings:
     requested_mode: str = "PREFLIGHT"
     account_id: str = ""              # optional; auto-discovered if blank
     max_qty: int = 1
-    max_premium: Decimal = Decimal("2.00")
+    max_premium: Decimal = Decimal("5.00")  # OPEN limit only; exits are never capped
     max_orders_per_day: int = 3
-    max_daily_opens: Decimal = Decimal("300")  # $ spent on OPEN orders per ET day
+    max_daily_opens: Decimal = Decimal("1500")  # $ spent on OPEN orders per ET day
     allowlist: set[str] = field(default_factory=set)
     supabase_url: str = ""
     supabase_key: str = ""
@@ -221,9 +221,9 @@ class Settings:
             mode=mode,
             account_id=e.get("PUBLIC_ACCOUNT_ID", "").strip(),
             max_qty=_env_int(e, "MAX_QTY", 1, 1, 100),
-            max_premium=_env_decimal(e, "MAX_PREMIUM", "2.00"),
+            max_premium=_env_decimal(e, "MAX_PREMIUM", "5.00"),
             max_orders_per_day=_env_int(e, "MAX_ORDERS_PER_DAY", 3, 1, 1000),
-            max_daily_opens=_env_decimal(e, "MAX_DAILY_OPENS", "300"),
+            max_daily_opens=_env_decimal(e, "MAX_DAILY_OPENS", "1500"),
             allowlist={s.strip().upper() for s in e.get("ALLOWLIST", "").split(",") if s.strip()},
             supabase_url=e.get("SUPABASE_URL", "").rstrip("/"),
             supabase_key=e.get("SUPABASE_SERVICE_KEY", ""),
@@ -547,7 +547,8 @@ def validate(payload: dict, s: Settings) -> dict:
     if not price.is_finite() or price <= 0:
         raise Reject("limit_price must be > 0")
     price = price.quantize(Decimal("0.01"))
-    if price > s.max_premium:
+    # Exits are never capped: a pricey contract must still be closable.
+    if oc == "OPEN" and price > s.max_premium:
         raise Reject(f"limit_price {price} exceeds MAX_PREMIUM {s.max_premium}")
     try:
         qty_raw = Decimal(str(payload.get("qty")))
