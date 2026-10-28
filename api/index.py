@@ -6,6 +6,9 @@ selected contract on Alpaca's paper host and does not use LIVE_CONFIRM.
 
 A full OCC symbol is forwarded as sent. An underlying such as SPY selects a call (BUY) or put
 (SELL) for the configured expiry, or sells the stored runners when the alert flattens or flips.
+Positions are one row per underlying + strategy + mode, so a QQQ flatten cannot close SPY.
+Per-strategy selection and exit overrides live in BUILTIN_STRATEGY_OVERRIDES; STRATEGY_OVERRIDES
+(JSON) replaces individual keys. Daily order and spend caps stay shared across strategies.
 Selection stays on Public.com. PAPER then checks the OCC symbol at Alpaca and places the entry,
 take-profit, and optional stop there. LIVE still places only the order under consideration.
 """
@@ -20,7 +23,7 @@ import re
 import sys
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time as dtime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any, Callable, Literal, Never, Optional
@@ -43,6 +46,8 @@ STRATEGY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 MARKET_OPEN = dtime(9, 31)
 MARKET_CLOSE = dtime(15, 55)
 # Alpaca rejects new 0DTE entries before the cash close. SPY and QQQ have a later cutoff.
+# QQQ is always accepted so QQQ_EMA_VWAP needs no ALLOWLIST edit. SPY stays on ALLOWLIST.
+BUILTIN_UNDERLYINGS = frozenset({"QQQ"})
 PAPER_HOST = "paper-api.alpaca.markets"
 PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 PAPER_SPY_QQQ_CUTOFF = dtime(15, 30)
@@ -111,6 +116,138 @@ def _env_stop_percent(env: dict, key: str) -> Optional[Decimal]:
     return value
 
 
+# Fields a strategy profile may replace. Anything else (caps, expiry, fallbacks, mode) stays global.
+STRATEGY_OVERRIDE_KEYS = (
+    "delta_band_min",
+    "delta_band_max",
+    "itm_points",
+    "max_premium",
+    "tp_percent",
+    "tp_single",
+    "stop_loss_percent",
+    "max_qty",
+)
+# Checked-in defaults. An absent strategy uses the global env. STRATEGY_OVERRIDES merges per key
+# on top of these, so FlowVWAP is unchanged unless its name is listed there.
+BUILTIN_STRATEGY_OVERRIDE_RAW: dict[str, dict[str, Any]] = {
+    "QQQ_EMA_VWAP": {
+        "delta_band_min": "0.60",
+        "delta_band_max": "0.75",
+        "itm_points": "5",
+        "max_premium": "5.00",
+        "tp_percent": "50",
+        "tp_single": True,
+        "stop_loss_percent": None,
+        "max_qty": 1,
+    },
+}
+
+
+def _override_decimal(value: Any, label: str) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{label} must be a number")
+    try:
+        number = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise ValueError(f"{label} must be a number") from exc
+    if not number.is_finite():
+        raise ValueError(f"{label} must be a number")
+    return number
+
+
+def _bounded_decimal(value: Any, label: str, lo: Decimal, hi: Decimal) -> Decimal:
+    number = _override_decimal(value, label)
+    if number < lo or number > hi:
+        raise ValueError(f"{label} must be between {lo} and {hi}")
+    return number
+
+
+def _parse_stop_override(value: Any, label: str) -> Optional[Decimal]:
+    """Null or blank turns the stop off for that strategy. A number is the percent below entry."""
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip() == "":
+        return None
+    number = _override_decimal(value, label)
+    if number <= 0 or number >= 100:
+        raise ValueError(f"{label} must be between 0 and 100, or null to disable")
+    return number
+
+
+def _parse_override_fields(name: str, fields: Any, source: str) -> dict[str, Any]:
+    label = f"{source}[{name}]"
+    if not isinstance(fields, dict):
+        raise ValueError(f"{label} must be an object")
+    unknown = sorted(set(fields) - set(STRATEGY_OVERRIDE_KEYS))
+    if unknown:
+        raise ValueError(f"{label} has unknown keys: {', '.join(unknown)}")
+    parsed: dict[str, Any] = {}
+    if "delta_band_min" in fields:
+        parsed["delta_band_min"] = _bounded_decimal(
+            fields["delta_band_min"], f"{label}.delta_band_min", Decimal(0), Decimal(1))
+    if "delta_band_max" in fields:
+        parsed["delta_band_max"] = _bounded_decimal(
+            fields["delta_band_max"], f"{label}.delta_band_max", Decimal(0), Decimal(1))
+    if "itm_points" in fields:
+        parsed["itm_points"] = _bounded_decimal(
+            fields["itm_points"], f"{label}.itm_points", Decimal(0), Decimal(50))
+    if "max_premium" in fields:
+        premium = _override_decimal(fields["max_premium"], f"{label}.max_premium")
+        if premium <= 0:
+            raise ValueError(f"{label}.max_premium must be > 0")
+        parsed["max_premium"] = premium
+    if "tp_percent" in fields:
+        parsed["tp_percent"] = _bounded_decimal(
+            fields["tp_percent"], f"{label}.tp_percent", Decimal(0), Decimal(500))
+    if "tp_single" in fields:
+        flag = fields["tp_single"]
+        if not isinstance(flag, bool):
+            raise ValueError(f"{label}.tp_single must be true or false")
+        parsed["tp_single"] = flag
+    if "stop_loss_percent" in fields:
+        parsed["stop_loss_percent"] = _parse_stop_override(
+            fields["stop_loss_percent"], f"{label}.stop_loss_percent")
+    if "max_qty" in fields:
+        qty = fields["max_qty"]
+        if isinstance(qty, bool) or not isinstance(qty, int) or qty < 1 or qty > 100:
+            raise ValueError(f"{label}.max_qty must be an integer from 1 to 100")
+        parsed["max_qty"] = qty
+    return parsed
+
+
+def _builtin_strategy_overrides() -> dict[str, dict[str, Any]]:
+    return {
+        name: _parse_override_fields(name, fields, "builtin strategy")
+        for name, fields in BUILTIN_STRATEGY_OVERRIDE_RAW.items()
+    }
+
+
+BUILTIN_STRATEGY_OVERRIDES = _builtin_strategy_overrides()
+
+
+def _parse_strategy_overrides(text: str) -> dict[str, dict[str, Any]]:
+    """STRATEGY_OVERRIDES is optional JSON: {\"StrategyName\": {\"max_premium\": \"5.00\", ...}}."""
+    if text == "":
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("STRATEGY_OVERRIDES must be a JSON object") from exc
+    if not isinstance(data, dict):
+        raise ValueError("STRATEGY_OVERRIDES must be a JSON object")
+    parsed: dict[str, dict[str, Any]] = {}
+    for name, fields in data.items():
+        if not isinstance(name, str) or not STRATEGY_RE.match(name):
+            raise ValueError(f"STRATEGY_OVERRIDES key {name!r} is not a valid strategy name")
+        parsed[name] = _parse_override_fields(name, fields, "STRATEGY_OVERRIDES")
+    return parsed
+
+
+def _allowlist(env: dict) -> set[str]:
+    listed = {item.strip().upper() for item in env.get("ALLOWLIST", "").split(",") if item.strip()}
+    return listed | set(BUILTIN_UNDERLYINGS)
+
+
 def _paper_base_url(env: dict) -> str:
     """PAPER mode may talk only to Alpaca's paper host. The live trading host is refused."""
     text = _env_text(env, "ALPACA_BASE_URL") or PAPER_BASE_URL
@@ -160,6 +297,37 @@ class Settings:
     alpaca_key_id: str = ""
     alpaca_secret_key: str = ""
     alpaca_base_url: str = ""
+    # Env layer only. Built-in profiles are applied in for_strategy and are not stored here.
+    strategy_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def overridable_view(self) -> dict[str, Any]:
+        """Effective selection and exit fields a strategy profile can replace. No secrets."""
+        return {
+            "delta_band_min": format(self.delta_band_min, "f"),
+            "delta_band_max": format(self.delta_band_max, "f"),
+            "itm_points": format(self.itm_points, "f"),
+            "max_premium": format(self.max_premium, "f"),
+            "max_qty": self.max_qty,
+            "tp_percent": format(self.tp_percent, "f"),
+            "tp_single": self.tp_single,
+            "stop_loss_percent": None if self.stop_loss_percent is None else format(self.stop_loss_percent, "f"),
+        }
+
+    def for_strategy(self, name: str) -> "Settings":
+        """Global settings with that strategy's built-in profile, then STRATEGY_OVERRIDES, applied.
+
+        Unknown strategy names return this object unchanged. Caps, expiry, and mode are not copied
+        from a profile, so every strategy shares MAX_ORDERS_PER_DAY and MAX_DAILY_OPENS.
+        """
+        merged = dict(BUILTIN_STRATEGY_OVERRIDES.get(name, {}))
+        merged.update(self.strategy_overrides.get(name, {}))
+        if not merged:
+            return self
+        return replace(self, **merged)
+
+    def strategy_public_view(self) -> dict[str, dict[str, Any]]:
+        names = set(BUILTIN_STRATEGY_OVERRIDES) | set(self.strategy_overrides)
+        return {name: self.for_strategy(name).overridable_view() for name in sorted(names)}
 
     def public_view(self) -> dict[str, Any]:
         """Non-secret tunables safe to log and return from /health."""
@@ -182,7 +350,18 @@ class Settings:
             "max_exit_orders_per_day": self.max_exit_orders_per_day,
             "enforce_hours": self.enforce_hours,
             "alpaca_configured": bool(self.alpaca_key_id and self.alpaca_secret_key),
+            "strategies": self.strategy_public_view(),
+            "daily_caps": "shared",
         }
+
+    def _validate_strategy_profiles(self) -> None:
+        names = set(BUILTIN_STRATEGY_OVERRIDES) | set(self.strategy_overrides)
+        for name in sorted(names):
+            profile = self.for_strategy(name)
+            if profile.delta_band_min < 0 or profile.delta_band_max > 1 or profile.delta_band_min > profile.delta_band_max:
+                raise ValueError(
+                    f"strategy {name} delta band must satisfy 0 <= min <= max <= 1 "
+                    f"(got {profile.delta_band_min}..{profile.delta_band_max})")
 
     @classmethod
     def from_env(cls, env: Optional[dict] = None) -> "Settings":
@@ -214,7 +393,7 @@ class Settings:
         tp_fraction = _env_decimal(e, "TP_FRACTION", "0.50")
         if tp_fraction < 0 or tp_fraction > 1:
             raise ValueError("TP_FRACTION must be between 0 and 1")
-        return cls(
+        settings = cls(
             public_secret=e.get("PUBLIC_SECRET", ""),
             webhook_passphrase=e.get("WEBHOOK_PASSPHRASE", ""),
             requested_mode=requested,
@@ -224,7 +403,7 @@ class Settings:
             max_premium=_env_decimal(e, "MAX_PREMIUM", "5.00"),
             max_orders_per_day=_env_int(e, "MAX_ORDERS_PER_DAY", 3, 1, 1000),
             max_daily_opens=_env_decimal(e, "MAX_DAILY_OPENS", "1500"),
-            allowlist={s.strip().upper() for s in e.get("ALLOWLIST", "").split(",") if s.strip()},
+            allowlist=_allowlist(e),
             supabase_url=e.get("SUPABASE_URL", "").rstrip("/"),
             supabase_key=e.get("SUPABASE_SERVICE_KEY", ""),
             enforce_hours=_env_bool(e, "ENFORCE_MARKET_HOURS", True),
@@ -243,7 +422,10 @@ class Settings:
             alpaca_key_id=alpaca_key_id,
             alpaca_secret_key=alpaca_secret_key,
             alpaca_base_url=alpaca_base_url,
+            strategy_overrides=_parse_strategy_overrides(_env_text(e, "STRATEGY_OVERRIDES")),
         )
+        settings._validate_strategy_profiles()
+        return settings
 
 
 # --------------------------------------------------------------------------- logging
@@ -547,7 +729,7 @@ def validate(payload: dict, s: Settings) -> dict:
     if not price.is_finite() or price <= 0:
         raise Reject("limit_price must be > 0")
     price = price.quantize(Decimal("0.01"))
-    # Exits are never capped: a pricey contract must still be closable.
+    # Opens only. A close or flatten is never blocked by this cap, for any strategy.
     if oc == "OPEN" and price > s.max_premium:
         raise Reject(f"limit_price {price} exceeds MAX_PREMIUM {s.max_premium}")
     try:
@@ -2121,7 +2303,9 @@ async def reconcile_paper_positions(store: "Store", alpaca: AlpacaClient, s: "Se
             if status == "FILLED" and not row.get("exits_placed"):
                 contract = await alpaca.get_contract(alpaca_option_symbol(str(row.get("symbol") or "")))
                 price = fill_price(row.get("_entry_order") or {}, Decimal(str(row.get("entry_limit") or "0")))
-                take_profit, stop = await submit_paper_exits(alpaca, store, s, day, row, price, contract_is_penny(contract))
+                profile = s.for_strategy(strategy)
+                take_profit, stop = await submit_paper_exits(
+                    alpaca, store, profile, day, row, price, contract_is_penny(contract))
                 apply_exit_reports(row, take_profit, stop)
             await save_refreshed_paper(store, row)
             results.append({
@@ -2143,6 +2327,7 @@ async def run_paper_alert(payload: dict, alert_id: str, day: str, now: datetime,
     exit_slot = None
     broker_sent = False
     try:
+        s = s.for_strategy(strategy_name(payload))
         kind, symbol = classify_symbol(payload.get("symbol", ""))
         if kind == "underlying":
             strategy = strategy_name(payload)
@@ -2176,6 +2361,7 @@ async def run_paper_alert(payload: dict, alert_id: str, day: str, now: datetime,
             contract = await alpaca.get_contract(broker_symbol)
             penny = contract_is_penny(contract)
             limit = round_option_price(o["limit_price"], penny)
+            # Closes are not checked again. A fill above the cap still has to be sellable.
             if limit > s.max_premium:
                 raise Reject(f"limit_price {limit} exceeds MAX_PREMIUM {s.max_premium}")
             notional = limit * o["qty"] * 100
@@ -2388,6 +2574,48 @@ async def _paper_sell_close(payload: dict, alert_id: str, selection: Optional[di
     return respond(200, response)
 
 
+async def run_readonly_preflight(payload: dict, s: "Settings", client: "PublicClient", store: "Store",
+                                 now: datetime) -> dict:
+    """Pick the contract and ask Public.com to preflight it.
+
+    Market hours are not enforced. This does not place an order, write a position or order row,
+    or consume a daily cap. A read of the open position, if any, is only used to tell an open
+    from a flatten.
+    """
+    profile = replace(s.for_strategy(strategy_name(payload)), enforce_hours=False)
+    order_payload, selection = await prepare_order(payload, profile, client, store, now)
+    if selection is not None and selection.get("skip_order"):
+        return {
+            "ok": True, "passed": False, "order_placed": False,
+            "contract": selection.get("chosen_symbol"), "premium": None, "delta": selection.get("delta"),
+            "reason": selection.get("note"), "selection": selection,
+        }
+    order = validate(order_payload, profile)
+    body = order_body(order)
+    try:
+        response = await client.preflight(body)
+        preview = _json(response)
+    except (httpx.HTTPError, RuntimeError, KeyError) as exc:
+        raise Reject(f"upstream error: {type(exc).__name__}", 502) from exc
+    contract = order["symbol"]
+    premium = f"{order['limit_price']:.2f}"
+    delta = None
+    if selection is not None:
+        contract = selection.get("chosen_symbol") or contract
+        premium = selection.get("limit") or premium
+        delta = selection.get("delta")
+    jlog("readonly_preflight", passed=response.status_code < 400, contract=contract,
+         premium=premium, delta=delta, status=response.status_code)
+    report = {
+        "ok": True, "passed": response.status_code < 400, "preflight_status": response.status_code,
+        "order_placed": False, "contract": contract, "premium": premium, "delta": delta,
+        "preflight": preview,
+    }
+    if selection is not None:
+        report["selection"] = selection
+    return report
+
+
 # --------------------------------------------------------------------------- app
 def create_app(settings: Optional[Settings] = None,
                transport: Optional[httpx.AsyncBaseTransport] = None,
@@ -2450,6 +2678,28 @@ def create_app(settings: Optional[Settings] = None,
             body["reconciled"] = reconciled
         return body
 
+    @app.post("/preflight")
+    async def preflight(request: Request):
+        # Same passphrase as /webhook. Selects and preflights only. Never places or persists.
+        try:
+            payload = json.loads(await request.body())
+            if not isinstance(payload, dict):
+                raise ValueError
+        except ValueError:
+            return respond(400, {"ok": False, "error": "body must be a JSON object", "order_placed": False})
+        jlog("request", body=payload)
+        pw = str(payload.get("passphrase", ""))
+        if not s.webhook_passphrase or not hmac.compare_digest(pw.encode(), s.webhook_passphrase.encode()):
+            return respond(401, {"ok": False, "error": "unauthorized", "order_placed": False})
+        try:
+            report = await run_readonly_preflight(payload, s, client, store, clock())
+        except Reject as exc:
+            return respond(exc.status, {"ok": False, "error": exc.reason, "order_placed": False})
+        except (StoreError, httpx.HTTPError) as exc:
+            return respond(503, {"ok": False, "order_placed": False,
+                                 "error": f"state store unavailable: {type(exc).__name__}"})
+        return respond(200, report)
+
     @app.post("/webhook")
     async def webhook(request: Request):
         try:
@@ -2482,7 +2732,8 @@ def create_app(settings: Optional[Settings] = None,
         releases: list[tuple] = []
         selection: Optional[dict] = None
         try:
-            order_payload, selection = await prepare_order(payload, s, client, store, now)
+            profile = s.for_strategy(strategy_name(payload))
+            order_payload, selection = await prepare_order(payload, profile, client, store, now)
             if selection is not None and selection.get("skip_order"):
                 await store.log_pick(alert_id, day, s.mode, selection)
                 jlog("contract_pick", alert_id=alert_id, selection=selection)
@@ -2509,18 +2760,19 @@ def create_app(settings: Optional[Settings] = None,
                     body["cancel_stop"] = selection["cancel_stop"]
                 return respond(200, body)
             if selection is not None:
-                await store.log_pick(alert_id, day, s.mode, selection)
+                await store.log_pick(alert_id, day, profile.mode, selection)
                 jlog("contract_pick", alert_id=alert_id, selection=selection)
-            o = validate(order_payload, s)
+            o = validate(order_payload, profile)
             # Underlying alerts already failed closed on the window before any Public call.
-            if selection is None and s.enforce_hours and not in_hours(now):
+            if selection is None and profile.enforce_hours and not in_hours(now):
                 raise Reject(hours_error(now))
             is_open = o["open_close"] == "OPEN"
             is_exit = not is_open
-            reason = await store.try_consume(day, s.mode, o["notional"], is_open, s, is_exit=is_exit)
+            reason = await store.try_consume(day, profile.mode, o["notional"], is_open, profile, is_exit=is_exit)
             if reason:
                 raise Reject(reason)
-            releases.append(cap_slot(day, s.mode, o["notional"], is_open, is_exit, s.exits_count_toward_order_cap))
+            releases.append(cap_slot(
+                day, profile.mode, o["notional"], is_open, is_exit, profile.exits_count_toward_order_cap))
         except Reject as e:
             await store.finish(alert_id, "REJECTED", mode=s.mode, detail=audit_detail(selection, reason=e.reason))
             return respond(e.status, error_body(alert_id, e.reason, selection))
@@ -2584,10 +2836,10 @@ def create_app(settings: Optional[Settings] = None,
             take_profit = None
             stop = None
             if o["open_close"] == "OPEN":
-                take_profit, slot = await plan_take_profit(o, s, client, store, day)
+                take_profit, slot = await plan_take_profit(o, profile, client, store, day)
                 if slot is not None:
                     releases.append(slot)
-                stop, stop_slot = await plan_stop(o, s, client, store, day)
+                stop, stop_slot = await plan_stop(o, profile, client, store, day)
                 if stop_slot is not None:
                     releases.append(stop_slot)
             blocked = await persist(take_profit, stop)

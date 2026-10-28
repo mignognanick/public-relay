@@ -1,5 +1,5 @@
 {
-  "_comment": "Paste ONE object below (without this wrapper) into the TradingView alert Message box. underlying_template lets FlowVWAP send the underlying; the relay selects the contract (0DTE unless EXPIRY_DAYS is set). qty comes from the strategy. Partial take-profit needs MAX_QTY >= 2 (default MAX_QTY is 1) or TP_SINGLE=true. STOP_LOSS_PERCENT is an environment setting, empty by default, and is not an alert field. MODE=PAPER is also an environment setting, not an alert field. template/fixed_example still send a full OCC symbol.",
+  "_comment": "Paste ONE object below (without this wrapper) into the TradingView alert Message box. underlying_template is FlowVWAP and uses the global env settings. qqq_underlying_template is QQQ_EMA_VWAP and uses the checked-in profile (delta 0.60-0.75, max premium 5.00 on opens, 50% take-profit, no stop, max qty 1). qty comes from the strategy. STOP_LOSS_PERCENT and MODE are environment settings, not alert fields. template/fixed_example still send a full OCC symbol.",
   "underlying_template": {
     "passphrase": "REPLACE_WITH_WEBHOOK_PASSPHRASE",
     "symbol": "{{ticker}}",
@@ -9,6 +9,17 @@
     "market_position": "{{strategy.market_position}}",
     "prev_market_position": "{{strategy.prev_market_position}}",
     "strategy": "FlowVWAP",
+    "alert_id": "{{ticker}}-{{strategy.order.id}}-{{timenow}}"
+  },
+  "qqq_underlying_template": {
+    "passphrase": "REPLACE_WITH_WEBHOOK_PASSPHRASE",
+    "symbol": "{{ticker}}",
+    "side": "{{strategy.order.action}}",
+    "qty": "{{strategy.order.contracts}}",
+    "underlying_price": "{{close}}",
+    "market_position": "{{strategy.market_position}}",
+    "prev_market_position": "{{strategy.prev_market_position}}",
+    "strategy": "QQQ_EMA_VWAP",
     "alert_id": "{{ticker}}-{{strategy.order.id}}-{{timenow}}"
   },
   "template": {
