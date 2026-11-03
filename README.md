@@ -16,8 +16,11 @@
   alert cancels a resting take-profit and stop, then sells every contract still open (runners and any
   take-profit contracts that have not filled). It does not open the other side on the same alert.
   The position key is underlying + strategy + mode, so a QQQ flatten cannot close a SPY position.
-  `QQQ_EMA_VWAP` has its own selection and exit defaults; `FlowVWAP` keeps the global env values.
-  No new Supabase migration: `0005_paper_orders.sql` is still the latest.
+  `QQQ_EMA_VWAP` keeps its own selection and exit defaults. `FlowVWAP` has its own profile
+  (delta 0.50–0.60, 0.50 points ITM, 5 contracts, no premium cap, underlying exits).
+  `0006_flowvwap_levels.sql` adds the entry underlying prices and `daily_levels`. Apply it
+  after `0005` before this version serves FlowVWAP. QQQ opens still record if the new
+  columns are left null.
   `underlying_price` (`{{close}}`) sets ATM; if it is missing, the relay uses the equity quote.
   The pick is written to `contract_picks` and returned as `selection`, with the order that would have been
   sent as `order`. Templates are in `sample_alert.json`. Defaults stay MODE=PREFLIGHT.
@@ -44,7 +47,7 @@ are unchanged: LIVE still requires both `MODE=LIVE` and `LIVE_CONFIRM=I_UNDERSTA
 | `ALLOWLIST` | empty | Comma-separated underlyings. Empty allows nothing else. `QQQ` is always added, so this does not need an edit for the new strategy. `SPY` stays on this list (production already has it; do not remove it). |
 | `MAX_QTY` | `1` | Max contracts on one order (1–100). Partial take-profit needs this at least 2, unless `TP_SINGLE` is on. Overridable per strategy. |
 | `MAX_PREMIUM` | `5.00` | Max limit price on an entry. A close or flatten is never blocked by this cap, for any strategy. The take-profit limit and the stop price are also outside this check. Overridable per strategy. |
-| `STRATEGY_OVERRIDES` | empty | Optional JSON object keyed by the alert's `strategy` field. Merges on top of the checked-in profiles. Leave unset to use the shipped `QQQ_EMA_VWAP` defaults. |
+| `STRATEGY_OVERRIDES` | empty | Optional JSON object keyed by the alert's `strategy` field. Merges on top of the checked-in profiles. Leave unset to use the shipped profiles. A `FlowVWAP` key, if set, replaces those keys. The JSON Nick would apply is in the FlowVWAP section. This repo does not set it. |
 | `MAX_ORDERS_PER_DAY` | `3` | Entry orders per ET day, counted separately for PREFLIGHT, PAPER, and LIVE. Shared across strategies. |
 | `MAX_DAILY_OPENS` | `1500` | Max dollars of premium on OPEN orders per ET day. The entry spends `limit × full qty × 100`. Shared across strategies. Production sets `1000` explicitly; leave that value as it is. |
 | `MAX_EXIT_ORDERS_PER_DAY` | `6` | Take-profit, stop, and flatten orders per ET day. A round trip that attaches both exits uses 3. The default fits two of those. |
@@ -64,18 +67,19 @@ are unchanged: LIVE still requires both `MODE=LIVE` and `LIVE_CONFIRM=I_UNDERSTA
 | `SUPABASE_SERVICE_KEY` | empty | Service-role key. Server only. |
 | `CRON_SECRET` | empty | Bearer token for `GET /keepalive`. |
 
-`/health` returns every tunable above except the secrets. `settings.strategies` is the effective per-strategy block (built-in profiles plus `STRATEGY_OVERRIDES`). A strategy that is not listed there, including `FlowVWAP`, uses the global `settings` values. `settings.daily_caps` is `shared`.
+`/health` returns every tunable above except the secrets. `settings.strategies` is the effective per-strategy block (built-in profiles plus `STRATEGY_OVERRIDES`). A strategy that is not listed there uses the global `settings` values. `FlowVWAP` and `QQQ_EMA_VWAP` are both listed. `settings.daily_caps` is `shared`.
 
 ## Per-strategy settings
 
 Checked-in defaults live in `BUILTIN_STRATEGY_OVERRIDES` in `api/index.py`. That is the source that ships without an env edit. `STRATEGY_OVERRIDES` is optional JSON and replaces individual keys for a strategy; omitted keys keep the built-in value, then the global env. The strategy name must match the alert's `strategy` field exactly. No Vercel variable has to change for `QQQ_EMA_VWAP`.
 
-Overridable keys: `delta_band_min`, `delta_band_max`, `itm_points`, `max_premium`, `tp_percent`, `tp_single`, `stop_loss_percent`, `max_qty`. Caps, expiry, limit fallbacks, hours, and mode are not overridable.
+Overridable keys: `delta_band_min`, `delta_band_max`, `itm_points`, `max_premium`, `tp_percent`, `tp_single`, `stop_loss_percent`, `max_qty`, `order_qty`, `flow_rules`. `max_premium: null` removes that strategy's open cap. Daily caps, expiry, limit fallbacks, and mode are not overridable.
 
-| Strategy | Delta | ITM | Max premium (opens) | Take-profit | Stop | Max qty |
-| --- | --- | --- | --- | --- | --- | --- |
-| `FlowVWAP` (and any other name) | global `0.50`–`0.60` | global `5` | global `MAX_PREMIUM` | global `TP_PERCENT`, `TP_SINGLE` off unless the env says otherwise | global `STOP_LOSS_PERCENT` | global `MAX_QTY` |
-| `QQQ_EMA_VWAP` | `0.60`–`0.75` | `5` | `5.00` | `50%`, `TP_SINGLE` on | off | `1` |
+| Strategy | Delta | ITM | Max premium (opens) | Exits | Qty |
+| --- | --- | --- | --- | --- | --- |
+| `FlowVWAP` | `0.50`–`0.60` | `0.50` | none (`null`) | SPY underlying stop 0.50 / target +1.00, whole position. No premium take-profit or stop. | 5 (`order_qty`) |
+| `QQQ_EMA_VWAP` | `0.60`–`0.75` | `5` | `5.00` | `50%` take-profit, `TP_SINGLE` on, premium stop off | `1` |
+| any other name | global `0.50`–`0.60` | global `5` | global `MAX_PREMIUM` | global premium take-profit and stop | global `MAX_QTY` |
 
 Example, only if a shipped value needs a change (not required):
 
@@ -83,13 +87,69 @@ Example, only if a shipped value needs a change (not required):
 {"QQQ_EMA_VWAP": {"max_premium": "6.00", "stop_loss_percent": null}}
 ```
 
-Daily caps stay shared on `(day, mode)`, which is how `daily_counters` already works. `MAX_ORDERS_PER_DAY` (3) and `MAX_DAILY_OPENS` (code default 1500; production sets 1000) count FlowVWAP and QQQ together, and so does the exit-order cap. A QQQ open at the $5 premium is $500 of that shared spend budget. Splitting the caps would raise the loss limit, so they stay one pool. Positions do not: each open row is `(underlying, strategy, mode)`.
+Daily caps stay shared on `(day, mode)`, which is how `daily_counters` already works. `MAX_ORDERS_PER_DAY` (3) and `MAX_DAILY_OPENS` (code default 1500; production sets 1000) count FlowVWAP and QQQ together. A FlowVWAP open of 5 contracts spends `limit × 5 × 100` of that same pool. Splitting the caps would raise the loss limit, so they stay one pool. Positions do not: each open row is `(underlying, strategy, mode)`.
+
+The FlowVWAP monitor sells the whole position and does not consume `MAX_ORDERS_PER_DAY` or `MAX_EXIT_ORDERS_PER_DAY`, so a full exit cap cannot block the 11:30 flatten.
+
+## FlowVWAP (SPY 0DTE)
+
+Checked-in defaults in `BUILTIN_STRATEGY_OVERRIDES`. A long alert buys a call and a short alert buys a put, delta 0.50–0.60, from ATM through 0.50 points in the money. Quantity is 5. There is no open premium cap unless `STRATEGY_OVERRIDES` sets `max_premium` back to a number.
+
+Exits follow SPY, not the option premium. They replace a partial premium take-profit and any timed premium exit:
+
+- Stop when SPY trades 0.50 against the entry underlying price.
+- Target is +1.00 in the trade's direction, and no farther than two $1 strikes before the UW King. King only caps when it sits in the trade's direction. If the room from the entry to that target is under 0.50, the entry is skipped.
+- The stop, the target, and the 11:30 flatten each sell every contract still open.
+
+Entries are weekdays 09:30–11:30 ET. 11:30 is the flatten, not a new entry. This window replaces the global 09:31–15:55 check for FlowVWAP entries only. QQQ still uses 09:31–15:55.
+
+Flip skip: if the 9:30 open is within 1.00 of the UW flip (inclusive), no FlowVWAP entries for the rest of that day. A missing open or a missing flip does not skip.
+
+Regime: enter only when the 9:30 open is strictly below the prior regular-hours low and Daybreak bias is `TREND_SHORT`. If the open, the prior low, or the bias is missing, the entry is allowed and logged as `unverified`.
+
+The prior low and the 9:30 open come from Public.com regular-hours bars (`WEEK/ONE_DAY` and `DAY/ONE_MINUTE`). If that call fails and `MODE=PAPER` has Alpaca keys, the relay falls back to Alpaca IEX bars on `data.alpaca.markets`. It does not send orders there.
+
+`POST /levels` stores the day's UW levels. Auth is `Authorization: Bearer $CRON_SECRET` (the same secret as `/keepalive`). Body:
+
+```json
+{"symbol": "SPY", "day": "2026-11-03", "flip": 580.25, "king": 585.0, "daybreak_bias": "TREND_SHORT"}
+```
+
+`symbol` defaults to SPY and `day` defaults to today in America/New_York. Posting again replaces flip, king, and bias and leaves a cached 9:30 open in place. The relay cannot read `/workspace/uw-gex-<date>/levels-applied.json`.
+
+`GET` or `POST /flowvwap-monitor`, same bearer token, checks open FlowVWAP positions and applies the stop, the target, and the 11:30 flatten. A second call does not sell again: the row is already closed, and a paper sell reuses one Alpaca client order id. QQQ positions are ignored. This is not a Vercel cron. `vercel.json` still has only the weekday `/keepalive` ping.
+
+Outside timer (cron-job.org, GitHub Actions, or any free scheduler), every minute from 09:30 to 11:35 ET on weekdays:
+
+```bash
+curl -fsS -H "Authorization: Bearer $CRON_SECRET" \
+  "https://<your-deployment>/flowvwap-monitor"
+```
+
+And once around 09:15 ET, after the levels file is written, post `/levels` with that day's flip, king, and Daybreak bias. Do not add the path to `vercel.json` `crons` (that needs a paid cron).
+
+`STRATEGY_OVERRIDES` is optional. The code defaults already match the rules. Set this only if the Vercel value already has a `FlowVWAP` object, because those keys replace the code defaults. Merge it into the existing object and keep `QQQ_EMA_VWAP` if it is there. This repo does not set the variable.
+
+```json
+{
+  "FlowVWAP": {
+    "delta_band_min": "0.50",
+    "delta_band_max": "0.60",
+    "itm_points": "0.50",
+    "max_premium": null,
+    "max_qty": 5,
+    "order_qty": 5,
+    "stop_loss_percent": null,
+    "flow_rules": true
+  }
+}
+```
 
 `MAX_PREMIUM` applies to opens only. A close, flatten, take-profit, or stop is never rejected for being above the cap, for any strategy.
 
 ## Read-only preflight
 
-`POST /preflight` takes the same alert JSON and the same passphrase as `/webhook`. It selects the contract with that strategy's settings (`FlowVWAP` uses the global env, `QQQ_EMA_VWAP` uses its profile), then calls Public.com `preflight/single-leg`. The response has `contract`, `premium`, `delta`, and `passed`.
+`POST /preflight` takes the same alert JSON and the same passphrase as `/webhook`. It selects the contract with that strategy's settings (`FlowVWAP` and `QQQ_EMA_VWAP` each use their profile), then calls Public.com `preflight/single-leg`. The response has `contract`, `premium`, `delta`, and `passed`. FlowVWAP preflight still applies the flip, regime, and room checks. It does not apply the 09:30–11:30 clock, so a check after the close can still return the pick.
 
 It does not place an order on Public or Alpaca, does not write a position or order row, and does not count toward the daily caps. It ignores the market-hours window, so a check after the close still returns the pick. `/webhook` still rejects outside 09:31–15:55 ET.
 
@@ -146,7 +206,7 @@ What PAPER does:
 
 ## TradingView alert message
 
-Paste one object into the strategy alert **Message** box. Replace only the passphrase placeholder. Leave `open_close` off so the relay infers open vs close from `market_position` / `prev_market_position`. `qty` comes from the strategy. FlowVWAP partial take-profit stays idle while `MAX_QTY` is 1. `QQQ_EMA_VWAP` sells its one contract at the 50% take-profit (`TP_SINGLE`).
+Paste one object into the strategy alert **Message** box. Replace only the passphrase placeholder. Leave `open_close` off so the relay infers open vs close from `market_position` / `prev_market_position`. FlowVWAP ignores the alert quantity and buys 5. `QQQ_EMA_VWAP` sells its one contract at the 50% take-profit (`TP_SINGLE`).
 
 FlowVWAP, usually on SPY:
 
@@ -164,7 +224,7 @@ FlowVWAP, usually on SPY:
 }
 ```
 
-QQQ_EMA_VWAP. The `strategy` value has to be exactly `QQQ_EMA_VWAP` or the relay uses the global FlowVWAP settings.
+QQQ_EMA_VWAP. The `strategy` value has to be exactly `QQQ_EMA_VWAP`. Any other name uses the global settings, not the FlowVWAP profile.
 
 ```json
 {
@@ -210,4 +270,4 @@ How the research was done (`research/`, stdlib Python only):
 - `backtest.py` follows the relay: `choose_leg` ranking, mid-price limit, flatten-only reversals, TP_SINGLE take-profit, stop-limit, the PAPER cutoff and 15:40 flatten, and `MAX_PREMIUM` on opens only. `python research/backtest.py` reruns the grid in a few seconds; `pytest -q research/tests` covers the fill logic.
 - Bands below 0.50 delta need OTM strikes. The relay only picks ATM through `ITM_POINTS` in the money, so those bands were simulated with a 5-point OTM window and would need a relay change to trade.
 
-Those selection and exit values are the checked-in `QQQ_EMA_VWAP` profile. Do not copy them onto the global env: that would change FlowVWAP. `QQQ` is already on the allowlist. Leave `MODE`, `LIVE_CONFIRM`, and the production `MAX_DAILY_OPENS=1000` as they are.
+Those selection and exit values are the checked-in `QQQ_EMA_VWAP` profile. Do not copy them onto FlowVWAP or onto the global env. `QQQ` is already on the allowlist. Leave `MODE`, `LIVE_CONFIRM`, and the production `MAX_DAILY_OPENS=1000` as they are.

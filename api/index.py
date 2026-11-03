@@ -8,7 +8,8 @@ A full OCC symbol is forwarded as sent. An underlying such as SPY selects a call
 (SELL) for the configured expiry, or sells the stored runners when the alert flattens or flips.
 Positions are one row per underlying + strategy + mode, so a QQQ flatten cannot close SPY.
 Per-strategy selection and exit overrides live in BUILTIN_STRATEGY_OVERRIDES; STRATEGY_OVERRIDES
-(JSON) replaces individual keys. Daily order and spend caps stay shared across strategies.
+(JSON) replaces individual keys. FlowVWAP uses underlying exits and a 09:30-11:30 window.
+QQQ_EMA_VWAP keeps its premium take-profit profile. Daily order and spend caps stay shared.
 Selection stays on Public.com. PAPER then checks the OCC symbol at Alpaca and places the entry,
 take-profit, and optional stop there. LIVE still places only the order under consideration.
 """
@@ -33,6 +34,8 @@ from zoneinfo import ZoneInfo
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+from api import flowvwap
 
 ET = ZoneInfo("America/New_York")
 API_BASE = "https://api.public.com"
@@ -116,7 +119,7 @@ def _env_stop_percent(env: dict, key: str) -> Optional[Decimal]:
     return value
 
 
-# Fields a strategy profile may replace. Anything else (caps, expiry, fallbacks, mode) stays global.
+# Fields a strategy profile may replace. Daily caps, expiry, fallbacks, and mode stay global.
 STRATEGY_OVERRIDE_KEYS = (
     "delta_band_min",
     "delta_band_max",
@@ -126,9 +129,11 @@ STRATEGY_OVERRIDE_KEYS = (
     "tp_single",
     "stop_loss_percent",
     "max_qty",
+    "order_qty",
+    "flow_rules",
 )
 # Checked-in defaults. An absent strategy uses the global env. STRATEGY_OVERRIDES merges per key
-# on top of these, so FlowVWAP is unchanged unless its name is listed there.
+# on top of these. QQQ_EMA_VWAP is unchanged. FlowVWAP no longer inherits the global profile.
 BUILTIN_STRATEGY_OVERRIDE_RAW: dict[str, dict[str, Any]] = {
     "QQQ_EMA_VWAP": {
         "delta_band_min": "0.60",
@@ -139,6 +144,18 @@ BUILTIN_STRATEGY_OVERRIDE_RAW: dict[str, dict[str, Any]] = {
         "tp_single": True,
         "stop_loss_percent": None,
         "max_qty": 1,
+    },
+    # SPY 0DTE. Delta 0.50-0.60 from ATM through 0.50 points ITM. Five contracts, no premium cap.
+    # Exits are the underlying stop/target in flowvwap.py, not a premium percent.
+    "FlowVWAP": {
+        "delta_band_min": "0.50",
+        "delta_band_max": "0.60",
+        "itm_points": "0.50",
+        "max_premium": None,
+        "max_qty": 5,
+        "order_qty": 5,
+        "stop_loss_percent": None,
+        "flow_rules": True,
     },
 }
 
@@ -192,10 +209,14 @@ def _parse_override_fields(name: str, fields: Any, source: str) -> dict[str, Any
         parsed["itm_points"] = _bounded_decimal(
             fields["itm_points"], f"{label}.itm_points", Decimal(0), Decimal(50))
     if "max_premium" in fields:
-        premium = _override_decimal(fields["max_premium"], f"{label}.max_premium")
-        if premium <= 0:
-            raise ValueError(f"{label}.max_premium must be > 0")
-        parsed["max_premium"] = premium
+        raw_premium = fields["max_premium"]
+        if raw_premium is None or (isinstance(raw_premium, str) and raw_premium.strip() == ""):
+            parsed["max_premium"] = None  # this strategy has no open-premium cap
+        else:
+            premium = _override_decimal(raw_premium, f"{label}.max_premium")
+            if premium <= 0:
+                raise ValueError(f"{label}.max_premium must be > 0, or null for no cap")
+            parsed["max_premium"] = premium
     if "tp_percent" in fields:
         parsed["tp_percent"] = _bounded_decimal(
             fields["tp_percent"], f"{label}.tp_percent", Decimal(0), Decimal(500))
@@ -212,6 +233,19 @@ def _parse_override_fields(name: str, fields: Any, source: str) -> dict[str, Any
         if isinstance(qty, bool) or not isinstance(qty, int) or qty < 1 or qty > 100:
             raise ValueError(f"{label}.max_qty must be an integer from 1 to 100")
         parsed["max_qty"] = qty
+    if "order_qty" in fields:
+        order_qty = fields["order_qty"]
+        if order_qty is None:
+            parsed["order_qty"] = None
+        elif isinstance(order_qty, bool) or not isinstance(order_qty, int) or order_qty < 1 or order_qty > 100:
+            raise ValueError(f"{label}.order_qty must be an integer from 1 to 100, or null")
+        else:
+            parsed["order_qty"] = order_qty
+    if "flow_rules" in fields:
+        flag = fields["flow_rules"]
+        if not isinstance(flag, bool):
+            raise ValueError(f"{label}.flow_rules must be true or false")
+        parsed["flow_rules"] = flag
     return parsed
 
 
@@ -275,7 +309,9 @@ class Settings:
     requested_mode: str = "PREFLIGHT"
     account_id: str = ""              # optional; auto-discovered if blank
     max_qty: int = 1
-    max_premium: Decimal = Decimal("5.00")  # OPEN limit only; exits are never capped
+    max_premium: Optional[Decimal] = Decimal("5.00")  # OPEN limit only; None means no cap. Exits are never capped.
+    order_qty: Optional[int] = None  # when set, an open uses this size instead of the alert qty
+    flow_rules: bool = False  # FlowVWAP session, regime, and underlying exits
     max_orders_per_day: int = 3
     max_daily_opens: Decimal = Decimal("1500")  # $ spent on OPEN orders per ET day
     allowlist: set[str] = field(default_factory=set)
@@ -306,8 +342,10 @@ class Settings:
             "delta_band_min": format(self.delta_band_min, "f"),
             "delta_band_max": format(self.delta_band_max, "f"),
             "itm_points": format(self.itm_points, "f"),
-            "max_premium": format(self.max_premium, "f"),
+            "max_premium": None if self.max_premium is None else format(self.max_premium, "f"),
             "max_qty": self.max_qty,
+            "order_qty": self.order_qty,
+            "flow_rules": self.flow_rules,
             "tp_percent": format(self.tp_percent, "f"),
             "tp_single": self.tp_single,
             "stop_loss_percent": None if self.stop_loss_percent is None else format(self.stop_loss_percent, "f"),
@@ -339,7 +377,7 @@ class Settings:
             "open_limit_fallback": self.open_limit_fallback,
             "close_limit_fallback": self.close_limit_fallback,
             "max_qty": self.max_qty,
-            "max_premium": format(self.max_premium, "f"),
+            "max_premium": None if self.max_premium is None else format(self.max_premium, "f"),
             "max_orders_per_day": self.max_orders_per_day,
             "max_daily_opens": format(self.max_daily_opens, "f"),
             "tp_percent": format(self.tp_percent, "f"),
@@ -522,8 +560,10 @@ class Store:
                           stop_limit: Optional[str] = None, stop_order_id: Optional[str] = None,
                           stop_status: str = "NONE", entry_order_id: Optional[str] = None,
                           entry_status: str = "NONE", entry_filled: int = 0,
-                          exits_placed: bool = False) -> Optional[str]:
-        data = await self._rpc("relay_record_open", {
+                          exits_placed: bool = False, entry_underlying: Optional[str] = None,
+                          stop_underlying: Optional[str] = None, target_underlying: Optional[str] = None,
+                          regime: Optional[str] = None) -> Optional[str]:
+        args: dict[str, Any] = {
             "p_underlying": underlying, "p_strategy": strategy, "p_mode": mode, "p_symbol": symbol,
             "p_entry_side": entry_side, "p_right_side": right_side, "p_qty": qty, "p_strike": strike,
             "p_alert_id": alert_id, "p_qty_open": qty if qty_open is None else qty_open,
@@ -532,8 +572,35 @@ class Store:
             "p_stop_qty": stop_qty, "p_stop_filled": stop_filled, "p_stop_limit": stop_limit,
             "p_stop_order_id": stop_order_id, "p_stop_status": stop_status,
             "p_entry_order_id": entry_order_id, "p_entry_status": entry_status,
-            "p_entry_filled": entry_filled, "p_exits_placed": exits_placed})
+            "p_entry_filled": entry_filled, "p_exits_placed": exits_placed}
+        # Omitted unless a FlowVWAP open has them, so a database that is still on 0005
+        # can keep recording QQQ. FlowVWAP needs 0006.
+        levels = {
+            "p_entry_underlying": entry_underlying, "p_stop_underlying": stop_underlying,
+            "p_target_underlying": target_underlying, "p_regime": regime,
+        }
+        if any(value not in (None, "") for value in levels.values()):
+            args.update(levels)
+        data = await self._rpc("relay_record_open", args)
         return _rpc_reason(data, "relay_record_open")
+
+    async def get_levels(self, day: str, symbol: str) -> Optional[dict]:
+        data = await self._rpc("relay_get_levels", {"p_day": day, "p_symbol": symbol})
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not isinstance(data, dict):
+            return None
+        return data
+
+    async def upsert_levels(self, day: str, symbol: str, flip: str, king: str, bias: str) -> None:
+        await self._rpc("relay_upsert_levels", {
+            "p_day": day, "p_symbol": symbol, "p_flip": flip, "p_king": king, "p_daybreak_bias": bias})
+
+    async def save_session(self, day: str, symbol: str, open_930: Optional[str],
+                           prior_rth_low: Optional[str], source: str) -> None:
+        await self._rpc("relay_save_session", {
+            "p_day": day, "p_symbol": symbol, "p_open_930": open_930,
+            "p_prior_rth_low": prior_rth_low, "p_session_source": source})
 
     async def list_open_positions(self, mode: str) -> list:
         data = await self._rpc("relay_list_open_positions", {"p_mode": mode})
@@ -699,6 +766,15 @@ class PublicClient:
         return await public_json(self, "POST", f"/userapigateway/marketdata/{account}/quotes",
                                  body={"instruments": instruments}, what=what)
 
+    async def historic_bars(self, symbol: str, period: str, aggregation: str) -> dict:
+        """Regular-hours OHLCV. WEEK/ONE_DAY is the prior session; DAY/ONE_MINUTE is today's open."""
+        data = await public_json(
+            self, "GET", f"/userapigateway/historicdata/EQUITY/{symbol}/{period}/{aggregation}",
+            params=[("tradingSessionToggle", "REGULAR_HOURS")], what="equity bars")
+        if not isinstance(data, dict):
+            raise Reject("equity bars returned invalid JSON", 502)
+        return data
+
 
 # --------------------------------------------------------------------------- validation
 class Reject(Exception):
@@ -730,7 +806,8 @@ def validate(payload: dict, s: Settings) -> dict:
         raise Reject("limit_price must be > 0")
     price = price.quantize(Decimal("0.01"))
     # Opens only. A close or flatten is never blocked by this cap, for any strategy.
-    if oc == "OPEN" and price > s.max_premium:
+    # A profile with max_premium None (FlowVWAP) has no open cap.
+    if oc == "OPEN" and s.max_premium is not None and price > s.max_premium:
         raise Reject(f"limit_price {price} exceeds MAX_PREMIUM {s.max_premium}")
     try:
         qty_raw = Decimal(str(payload.get("qty")))
@@ -1469,7 +1546,8 @@ async def equity_spot(client: "PublicClient", underlying: str) -> Decimal:
 
 
 async def build_open(payload: dict, underlying: str, strategy: str, client: "PublicClient",
-                     s: "Settings", now: datetime, intent: str) -> tuple[dict, dict]:
+                     s: "Settings", now: datetime, intent: str, store: Optional["Store"] = None,
+                     market_data: Optional["AlpacaData"] = None) -> tuple[dict, dict]:
     side = alert_side(payload, required=True)
     if side is None:
         raise Reject("side must be BUY or SELL")
@@ -1479,6 +1557,11 @@ async def build_open(payload: dict, underlying: str, strategy: str, client: "Pub
         spot, spot_source = alert_px, "alert"
     else:
         spot, spot_source = await equity_spot(client, underlying), "quote"
+    gate: dict[str, Any] = {}
+    if s.flow_rules:
+        if store is None:
+            raise Reject("FlowVWAP needs the state store", 503)
+        gate = await flow_entry_gate(store, client, market_data, underlying, side, spot, now, s.enforce_hours)
     expiry = as_et(now).date() + timedelta(days=s.expiry_days)
     chain = await client.option_chain(underlying, expiry.isoformat())
     window = [leg for leg in legs_from_chain(chain, underlying, expiry, right)
@@ -1493,14 +1576,119 @@ async def build_open(payload: dict, underlying: str, strategy: str, client: "Pub
     window = [with_greeks(leg, greeks) for leg in window]
     chosen = choose_leg(window, spot, s.delta_band_min, s.delta_band_max)
     limit, limit_source = limit_from_market(chosen.bid, chosen.ask, s.open_limit_fallback)
+    qty = s.order_qty if s.order_qty is not None else payload.get("qty")
     order_payload = {
         "symbol": chosen.symbol, "side": "BUY", "open_close": "OPEN",
-        "limit_price": cents(limit), "qty": payload.get("qty"),
+        "limit_price": cents(limit), "qty": qty,
     }
     selection = selection_from_leg(
         "open", underlying, strategy, side, "BUY", "OPEN", spot, spot_source, expiry, right,
-        window, chosen, limit, limit_source, payload.get("qty"), intent)
+        window, chosen, limit, limit_source, qty, intent)
+    selection.update(gate)
     return order_payload, selection
+
+
+def _level_number(value: Any) -> Optional[Decimal]:
+    return parse_decimal(value)
+
+
+async def load_flow_context(store: "Store", client: "PublicClient", market_data: Optional["AlpacaData"],
+                            symbol: str, day: date) -> dict[str, Any]:
+    """UW levels from Supabase, plus the 9:30 open and prior RTH low from Public or Alpaca."""
+    cached = await store.get_levels(day.isoformat(), symbol) or {}
+    opened = _level_number(cached.get("open_930"))
+    prior = _level_number(cached.get("prior_rth_low"))
+    source = cached.get("session_source")
+    if opened is None or prior is None:
+        fetched_open, fetched_prior, fetched_source = await fetch_session(client, market_data, symbol, day)
+        if opened is None and fetched_open is not None:
+            opened = fetched_open
+        if prior is None and fetched_prior is not None:
+            prior = fetched_prior
+        if fetched_source:
+            source = fetched_source if source in (None, "") else source
+        if fetched_open is not None or fetched_prior is not None:
+            try:
+                await store.save_session(
+                    day.isoformat(), symbol,
+                    None if opened is None else format(opened, "f"),
+                    None if prior is None else format(prior, "f"),
+                    str(source or fetched_source or "public"))
+            except (StoreError, httpx.HTTPError):
+                jlog("flowvwap_session_cache_failed", symbol=symbol, day=day.isoformat())
+    cached["open_930"] = opened
+    cached["prior_rth_low"] = prior
+    cached["flip"] = _level_number(cached.get("flip"))
+    cached["king"] = _level_number(cached.get("king"))
+    return cached
+
+
+async def fetch_session(client: "PublicClient", market_data: Optional["AlpacaData"], symbol: str,
+                        day: date) -> tuple[Optional[Decimal], Optional[Decimal], Optional[str]]:
+    opened: Optional[Decimal] = None
+    prior: Optional[Decimal] = None
+    source: Optional[str] = None
+    try:
+        daily = await client.historic_bars(symbol, "WEEK", "ONE_DAY")
+        minutes = await client.historic_bars(symbol, "DAY", "ONE_MINUTE")
+        facts = flowvwap.session_facts(daily, minutes, day)
+        opened, prior = facts.get("open_930"), facts.get("prior_rth_low")
+        if opened is not None or prior is not None:
+            source = "public"
+    except Reject as exc:
+        jlog("flowvwap_public_bars_failed", symbol=symbol, error=exc.reason)
+    if (opened is None or prior is None) and market_data is not None:
+        try:
+            alt = await market_data.session(symbol, day)
+        except Reject as exc:
+            jlog("flowvwap_alpaca_bars_failed", symbol=symbol, error=exc.reason)
+            alt = {}
+        if opened is None and alt.get("open_930") is not None:
+            opened = alt["open_930"]
+            source = "alpaca" if source is None else "mixed"
+        if prior is None and alt.get("prior_rth_low") is not None:
+            prior = alt["prior_rth_low"]
+            source = "alpaca" if source is None else "mixed"
+    return opened, prior, source
+
+
+async def flow_entry_gate(store: "Store", client: "PublicClient", market_data: Optional["AlpacaData"],
+                          symbol: str, side: Literal["BUY", "SELL"], spot: Decimal, now: datetime,
+                          enforce_hours: bool) -> dict[str, Any]:
+    """FlowVWAP open checks. Raises Reject when the entry is not allowed. Logs unverified."""
+    if enforce_hours:
+        blocked = flowvwap.entry_block(now)
+        if blocked:
+            raise Reject(blocked)
+    day = as_et(now).date()
+    ctx = await load_flow_context(store, client, market_data, symbol, day)
+    skip = flowvwap.flip_skip(ctx.get("open_930"), ctx.get("flip"))
+    if skip:
+        jlog("flowvwap_flip_skip", symbol=symbol, open_930=ctx.get("open_930"), flip=ctx.get("flip"))
+        raise Reject(skip)
+    status, missing = flowvwap.regime(ctx.get("open_930"), ctx.get("prior_rth_low"), ctx.get("daybreak_bias"))
+    jlog("flowvwap_regime", regime=status, missing=missing or None, symbol=symbol,
+         open_930=ctx.get("open_930"), prior_rth_low=ctx.get("prior_rth_low"),
+         daybreak_bias=ctx.get("daybreak_bias"))
+    if status == "blocked":
+        raise Reject(
+            "FlowVWAP regime: the 9:30 open must be below the prior regular-hours low "
+            "and Daybreak bias must be TREND_SHORT")
+    if status == "unverified":
+        jlog("flowvwap_regime_unverified", regime="unverified", missing=missing, symbol=symbol)
+    plan = flowvwap.exit_levels(spot, side, ctx.get("king"))
+    jlog("flowvwap_target", symbol=symbol, side=side, entry=spot, stop=plan["stop"], target=plan["target"],
+         room=plan["room"], capped=plan["capped"], king=ctx.get("king"))
+    if plan["skip"]:
+        raise Reject(str(plan["skip"]))
+    return {
+        "regime": status,
+        "entry_underlying": dec_text(spot),
+        "stop_underlying": dec_text(plan["stop"]),
+        "target_underlying": dec_text(plan["target"]),
+        "target_room": dec_text(plan["room"]),
+        "target_capped": plan["capped"],
+    }
 
 
 async def reconcile_exits(stored: dict, client: "PublicClient", s: "Settings") -> dict:
@@ -1631,10 +1819,12 @@ async def build_close(payload: dict, underlying: str, strategy: str, client: "Pu
 
 
 async def prepare_underlying(payload: dict, underlying: str, s: "Settings", client: "PublicClient",
-                             store: "Store", now: datetime) -> tuple[dict, dict]:
+                             store: "Store", now: datetime,
+                             market_data: Optional["AlpacaData"] = None) -> tuple[dict, dict]:
     if underlying not in s.allowlist:
         raise Reject(f"underlying {underlying} not in ALLOWLIST")
-    if s.enforce_hours and not in_hours(now):
+    # FlowVWAP uses 09:30-11:30 for entries. Closes stay available so a flatten still sells.
+    if not s.flow_rules and s.enforce_hours and not in_hours(now):
         raise Reject(hours_error(now))
     strategy = strategy_name(payload)
     stored = await store.get_position(underlying, strategy, s.mode)
@@ -1643,7 +1833,7 @@ async def prepare_underlying(payload: dict, underlying: str, s: "Settings", clie
         case "open":
             if stored:
                 raise Reject(f"position already open for {underlying}/{strategy} ({stored.get('symbol')})")
-            return await build_open(payload, underlying, strategy, client, s, now, intent)
+            return await build_open(payload, underlying, strategy, client, s, now, intent, store, market_data)
         case "close":
             if not stored:
                 raise Reject(f"no open position for {underlying}/{strategy}")
@@ -1653,13 +1843,13 @@ async def prepare_underlying(payload: dict, underlying: str, s: "Settings", clie
 
 
 async def prepare_order(payload: dict, s: "Settings", client: "PublicClient", store: "Store",
-                        now: datetime) -> tuple[dict, Optional[dict]]:
+                        now: datetime, market_data: Optional["AlpacaData"] = None) -> tuple[dict, Optional[dict]]:
     kind, symbol = classify_symbol(payload.get("symbol", ""))
     match kind:
         case "occ":
             return payload, None
         case "underlying":
-            return await prepare_underlying(payload, symbol, s, client, store, now)
+            return await prepare_underlying(payload, symbol, s, client, store, now, market_data)
         case _ as unreachable:
             _never(unreachable)
 
@@ -1686,7 +1876,11 @@ async def book_position(store: "Store", selection: dict, order: dict, mode: str,
             stop_qty=int(held.get("quantity") or 0) if stop_on else 0,
             stop_filled=0, stop_limit=held.get("stop_price") if stop_on else None,
             stop_order_id=held.get("orderId") if stop_on else None,
-            stop_status="RESTING" if stop_on else "NONE")
+            stop_status="RESTING" if stop_on else "NONE",
+            entry_underlying=selection.get("entry_underlying"),
+            stop_underlying=selection.get("stop_underlying"),
+            target_underlying=selection.get("target_underlying"),
+            regime=selection.get("regime"))
     if action == "close":
         return await store.record_close(
             str(selection["underlying"]), str(selection["strategy"]), mode,
@@ -1710,6 +1904,11 @@ async def plan_take_profit(order: dict, s: "Settings", client: "PublicClient", s
     This never calls place(), including when MODE is LIVE. MAX_PREMIUM does not apply.
     """
     qty = int(order["qty"])
+    if s.flow_rules:
+        report = {"attached": False, "quantity": 0, "qty_open": qty, "runners": qty,
+                  "status": "NONE", "reason": flowvwap.UNDERLYING_EXIT}
+        jlog("take_profit", **report)
+        return report, None
     entry = order["limit_price"] if isinstance(order["limit_price"], Decimal) else Decimal(str(order["limit_price"]))
     tp_qty = take_profit_qty(qty, s.tp_fraction, s.tp_single)
     if tp_qty < 1:
@@ -1795,6 +1994,10 @@ async def plan_stop(order: dict, s: "Settings", client: "PublicClient", store: "
     unfilled and the flatten alert is what closes the contracts.
     """
     qty = int(order["qty"])
+    if s.flow_rules:
+        report = {"attached": False, "quantity": 0, "status": "NONE", "reason": flowvwap.UNDERLYING_EXIT}
+        jlog("stop", **report)
+        return report, None
     if s.stop_loss_percent is None:
         report = {"attached": False, "quantity": 0, "status": "NONE",
                   "reason": "STOP_LOSS_PERCENT is not set"}
@@ -1872,6 +2075,55 @@ def _json(r: httpx.Response) -> Any:
         return r.json()
     except ValueError:
         return r.text[:2000]
+
+
+class AlpacaData:
+    """Alpaca market data, used only when Public.com bars are missing. Orders stay on the paper host."""
+
+    def __init__(self, key: str, secret: str, transport: Optional[httpx.AsyncBaseTransport] = None):
+        self.http = httpx.AsyncClient(
+            base_url="https://data.alpaca.markets", timeout=8.0, transport=transport,
+            headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret, "Accept": "application/json"})
+
+    async def _bars(self, symbol: str, timeframe: str, start: str, end: str) -> list:
+        try:
+            response = await self.http.get(
+                f"/v2/stocks/{symbol}/bars",
+                params={"timeframe": timeframe, "start": start, "end": end, "feed": "iex",
+                        "adjustment": "raw", "limit": "1000"})
+        except httpx.HTTPError as exc:
+            raise Reject("Alpaca bars unreachable", 502) from exc
+        if response.status_code >= 400:
+            raise Reject(f"Alpaca bars failed ({response.status_code})", 502)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise Reject("Alpaca bars returned invalid JSON", 502) from exc
+        bars = payload.get("bars") if isinstance(payload, dict) else None
+        return [bar for bar in bars if isinstance(bar, dict)] if isinstance(bars, list) else []
+
+    async def session(self, symbol: str, day: date) -> dict[str, Optional[Decimal]]:
+        start = flowvwap.prior_lookback(day).isoformat()
+        end = (day + timedelta(days=1)).isoformat()
+        daily = await self._bars(symbol, "1Day", start, end)
+        open_at = datetime.combine(day, flowvwap.ENTRY_START, ET)
+        minute_end = open_at + timedelta(minutes=2)
+        minutes = await self._bars(symbol, "1Min", open_at.isoformat(), minute_end.isoformat())
+        return flowvwap.session_facts({"bars": daily}, {"bars": minutes}, day)
+
+    async def latest(self, symbol: str, now: datetime) -> Optional[Decimal]:
+        """Last regular minute close, for the monitor when the Public quote is down."""
+        current = as_et(now)
+        start = current - timedelta(minutes=20)
+        bars = await self._bars(symbol, "1Min", start.isoformat(), (current + timedelta(minutes=1)).isoformat())
+        for bar in reversed(bars):
+            raw = bar.get("c")
+            if raw in (None, ""):
+                raw = bar.get("close")
+            price = positive_price(raw)
+            if price is not None:
+                return price
+        return None
 
 
 # --------------------------------------------------------------------------- Alpaca paper
@@ -2180,8 +2432,15 @@ def _exit_report(attached: bool, quantity: int, **extra: Any) -> dict:
 
 async def submit_paper_exits(alpaca: AlpacaClient, store: Store, s: Settings, day: str, row: dict,
                              entry: Decimal, penny: bool) -> tuple[dict, dict]:
-    """Place the take-profit and stop after the entry has filled. Exit slots ignore the entry cap."""
+    """Place the take-profit and stop after the entry has filled. Exit slots ignore the entry cap.
+
+    FlowVWAP does not place those premium orders. The monitor sells the whole position
+    from the underlying stop, target, or 11:30 flatten.
+    """
     qty = _count_field(row, "entry_filled") or whole_qty(row.get("qty"))
+    if s.flow_rules:
+        blank = {"attached": False, "quantity": 0, "status": "NONE", "reason": flowvwap.UNDERLYING_EXIT}
+        return {**blank, "qty_open": qty, "runners": qty}, dict(blank)
     symbol = alpaca_option_symbol(str(row["symbol"]))
     entry_id = str(row.get("entry_order_id") or "")
     tp_qty = take_profit_qty(qty, s.tp_fraction, s.tp_single)
@@ -2243,19 +2502,19 @@ def apply_exit_reports(row: dict, take_profit: dict, stop: dict) -> None:
     elif not row.get("stop_order_id"):
         row["stop_status"] = "NONE"
         row["stop_qty"] = 0
+    tp_off = {
+        "single contract closes on the flatten alert; set TP_SINGLE to take profit that contract",
+        "TP_FRACTION is 0", "no take-profit quantity", flowvwap.UNDERLYING_EXIT,
+    }
+    stop_off = {"STOP_LOSS_PERCENT is not set", flowvwap.UNDERLYING_EXIT}
     row["exits_placed"] = bool(
-        (row.get("tp_order_id") or take_profit.get("quantity", 0) < 1 or take_profit.get("reason") in {
-            "single contract closes on the flatten alert; set TP_SINGLE to take profit that contract",
-            "TP_FRACTION is 0", "no take-profit quantity",
-        }) and (row.get("stop_order_id") or stop.get("reason") == "STOP_LOSS_PERCENT is not set")
+        (row.get("tp_order_id") or take_profit.get("quantity", 0) < 1 or take_profit.get("reason") in tp_off)
+        and (row.get("stop_order_id") or stop.get("reason") in stop_off)
     )
     # A cap or place failure leaves the leg without an id and must be retried.
-    if take_profit.get("quantity", 0) >= 1 and not row.get("tp_order_id") and take_profit.get("reason") not in {
-        "single contract closes on the flatten alert; set TP_SINGLE to take profit that contract",
-        "TP_FRACTION is 0", "no take-profit quantity",
-    }:
+    if take_profit.get("quantity", 0) >= 1 and not row.get("tp_order_id") and take_profit.get("reason") not in tp_off:
         row["exits_placed"] = False
-    if stop.get("reason") not in (None, "STOP_LOSS_PERCENT is not set") and not row.get("stop_order_id"):
+    if stop.get("reason") not in (None, *stop_off) and not row.get("stop_order_id"):
         row["exits_placed"] = False
 
 
@@ -2320,7 +2579,8 @@ async def reconcile_paper_positions(store: "Store", alpaca: AlpacaClient, s: "Se
 
 async def run_paper_alert(payload: dict, alert_id: str, day: str, now: datetime, s: "Settings",
                           store: "Store", public: "PublicClient", alpaca: AlpacaClient,
-                          sleep: Callable[[float], Any], respond: Callable[..., JSONResponse]) -> JSONResponse:
+                          sleep: Callable[[float], Any], respond: Callable[..., JSONResponse],
+                          market_data: Optional["AlpacaData"] = None) -> JSONResponse:
     """Place the Public.com-selected contract on Alpaca paper, then the exits once it fills."""
     selection: Optional[dict] = None
     entry_slot = None
@@ -2340,7 +2600,7 @@ async def run_paper_alert(payload: dict, alert_id: str, day: str, now: datetime,
                     blocked = paper_entry_cutoff(symbol, configured_expiry(now, s.expiry_days), now)
                     if blocked:
                         raise Reject(blocked)
-        order_payload, selection = await prepare_order(payload, s, public, store, now)
+        order_payload, selection = await prepare_order(payload, s, public, store, now, market_data)
         if selection is None and str(order_payload.get("open_close", "")).upper() == "OPEN":
             parsed = parse_occ(str(order_payload.get("symbol") or ""))
             if parsed:
@@ -2352,8 +2612,10 @@ async def run_paper_alert(payload: dict, alert_id: str, day: str, now: datetime,
             jlog("contract_pick", alert_id=alert_id, selection=selection)
         if selection is not None and selection.get("skip_order"):
             return await _paper_finish_flat(payload, alert_id, selection, s, store, alpaca, respond, sold=None)
+        if s.flow_rules and selection is None and str(order_payload.get("open_close", "")).upper() == "OPEN":
+            raise Reject("FlowVWAP entries must use the underlying symbol, not an OCC symbol")
         o = validate(order_payload, s)
-        if selection is None and s.enforce_hours and not in_hours(now):
+        if selection is None and s.enforce_hours and not s.flow_rules and not in_hours(now):
             raise Reject(hours_error(now))
         is_open = o["open_close"] == "OPEN"
         if is_open:
@@ -2362,7 +2624,7 @@ async def run_paper_alert(payload: dict, alert_id: str, day: str, now: datetime,
             penny = contract_is_penny(contract)
             limit = round_option_price(o["limit_price"], penny)
             # Closes are not checked again. A fill above the cap still has to be sellable.
-            if limit > s.max_premium:
+            if s.max_premium is not None and limit > s.max_premium:
                 raise Reject(f"limit_price {limit} exceeds MAX_PREMIUM {s.max_premium}")
             notional = limit * o["qty"] * 100
             reason = await store.try_consume(day, s.mode, notional, True, s, is_exit=False, exit_counts=False)
@@ -2422,7 +2684,11 @@ async def run_paper_alert(payload: dict, alert_id: str, day: str, now: datetime,
                     entry_limit=price_text(limit), tp_filled=0, stop_qty=int(row.get("stop_qty") or 0),
                     stop_filled=0, stop_limit=row.get("stop_limit"), stop_order_id=row.get("stop_order_id"),
                     stop_status=str(row.get("stop_status") or "NONE"), entry_order_id=str(placed.get("id")),
-                    entry_status=entry_status, entry_filled=filled, exits_placed=bool(row.get("exits_placed")))
+                    entry_status=entry_status, entry_filled=filled, exits_placed=bool(row.get("exits_placed")),
+                    entry_underlying=selection.get("entry_underlying"),
+                    stop_underlying=selection.get("stop_underlying"),
+                    target_underlying=selection.get("target_underlying"),
+                    regime=selection.get("regime"))
                 if reason:
                     jlog("position_persist_failed", alert_id=alert_id, reason=reason)
             await store.finish(alert_id, "ACCEPTED", "OPEN", notional, s.mode, {
@@ -2575,7 +2841,7 @@ async def _paper_sell_close(payload: dict, alert_id: str, selection: Optional[di
 
 
 async def run_readonly_preflight(payload: dict, s: "Settings", client: "PublicClient", store: "Store",
-                                 now: datetime) -> dict:
+                                 now: datetime, market_data: Optional["AlpacaData"] = None) -> dict:
     """Pick the contract and ask Public.com to preflight it.
 
     Market hours are not enforced. This does not place an order, write a position or order row,
@@ -2583,7 +2849,7 @@ async def run_readonly_preflight(payload: dict, s: "Settings", client: "PublicCl
     from a flatten.
     """
     profile = replace(s.for_strategy(strategy_name(payload)), enforce_hours=False)
-    order_payload, selection = await prepare_order(payload, profile, client, store, now)
+    order_payload, selection = await prepare_order(payload, profile, client, store, now, market_data)
     if selection is not None and selection.get("skip_order"):
         return {
             "ok": True, "passed": False, "order_placed": False,
@@ -2616,6 +2882,172 @@ async def run_readonly_preflight(payload: dict, s: "Settings", client: "PublicCl
     return report
 
 
+def cron_authorized(request: Request) -> bool:
+    """Bearer CRON_SECRET. Empty secret and a mismatched token are both unauthorized."""
+    secret = os.environ.get("CRON_SECRET", "")
+    auth = request.headers.get("authorization", "")
+    if not secret:
+        return False
+    try:
+        return hmac.compare_digest(auth.encode(), f"Bearer {secret}".encode())
+    except (TypeError, ValueError):
+        return False
+
+
+async def underlying_mark(client: "PublicClient", market_data: Optional[AlpacaData], symbol: str,
+                          now: datetime) -> Optional[Decimal]:
+    try:
+        return await equity_spot(client, symbol)
+    except Reject as exc:
+        jlog("flowvwap_spot_failed", symbol=symbol, error=exc.reason)
+    if market_data is None:
+        return None
+    try:
+        return await market_data.latest(symbol, now)
+    except Reject as exc:
+        jlog("flowvwap_spot_failed", symbol=symbol, source="alpaca", error=exc.reason)
+        return None
+
+
+async def option_close_limit(client: "PublicClient", symbol: str, fallback: LimitFallback) -> Decimal:
+    quoted = await client.quotes([{"symbol": symbol, "type": "OPTION"}], what="option quote")
+    quote = first_quote(quoted, "option quote")
+    limit, _source = limit_from_market(
+        positive_price(quote.get("bid")), positive_price(quote.get("ask")), fallback)
+    return limit
+
+
+async def run_flow_monitor(now: datetime, s: "Settings", store: "Store", client: "PublicClient",
+                           alpaca: Optional[AlpacaClient],
+                           market_data: Optional[AlpacaData]) -> dict:
+    """Stop, target, and 11:30 flatten for open FlowVWAP positions. Safe to call every minute.
+
+    A second call sees the row already closed, or reuses the Alpaca client order id, so it
+    does not sell twice. QQQ positions are left alone. These exits do not consume the daily
+    entry cap or the exit-order cap: a full cap must not block the flatten.
+    """
+    rows = await store.list_open_positions(s.mode)
+    actions = []
+    for row in rows:
+        if str(row.get("strategy") or "") != "FlowVWAP":
+            continue
+        try:
+            actions.append(await _monitor_flow_row(row, now, s, store, client, alpaca, market_data))
+        except Reject as exc:
+            actions.append({
+                "underlying": row.get("underlying"), "strategy": "FlowVWAP",
+                "action": "error", "error": exc.reason,
+            })
+    jlog("flowvwap_monitor", checked=len(actions), mode=s.mode)
+    return {"ok": True, "checked": len(actions), "actions": actions}
+
+
+async def _monitor_flow_row(row: dict, now: datetime, s: "Settings", store: "Store", client: "PublicClient",
+                            alpaca: Optional[AlpacaClient], market_data: Optional[AlpacaData]) -> dict:
+    symbol = str(row.get("underlying") or "")
+    side = str(row.get("entry_side") or "")
+    price = await underlying_mark(client, market_data, symbol, now)
+    signal = flowvwap.exit_signal(
+        now, side, price, parse_decimal(row.get("stop_underlying")), parse_decimal(row.get("target_underlying")))
+    report: dict[str, Any] = {
+        "underlying": symbol, "strategy": "FlowVWAP", "underlying_price": dec_text(price),
+        "entry_underlying": dec_text(parse_decimal(row.get("entry_underlying"))),
+        "stop_underlying": dec_text(parse_decimal(row.get("stop_underlying"))),
+        "target_underlying": dec_text(parse_decimal(row.get("target_underlying"))),
+    }
+    if signal is None:
+        report["action"] = "hold"
+        return report
+    plan = exit_plan(row)
+    qty = int(plan["still_open"])
+    report["action"] = signal
+    report["quantity"] = qty
+    occ = str(row.get("symbol") or "")
+    alert_id = f"flowvwap-monitor-{signal}-{row.get('opened_alert_id')}"
+    if qty < 1:
+        reason = await store.record_close(
+            symbol, "FlowVWAP", s.mode, occ, alert_id,
+            tp_status=plan["tp_status_after"], stop_status=plan["stop_status_after"],
+            tp_filled=plan["tp_filled"], stop_filled=plan["stop_filled"])
+        report["order_placed"] = False
+        report["note"] = reason or "nothing left open"
+        return report
+    limit: Optional[Decimal] = None
+    try:
+        limit = await option_close_limit(client, occ, s.close_limit_fallback)
+    except Reject as exc:
+        if s.mode in ("PAPER", "LIVE"):
+            report["order_placed"] = False
+            report["error"] = exc.reason
+            return report
+    if s.mode == "PAPER":
+        if alpaca is None or limit is None:
+            report["order_placed"] = False
+            report["error"] = "Alpaca is not configured" if alpaca is None else "no option quote"
+            return report
+        return await _paper_flow_exit(report, row, alpaca, store, s, occ, qty, limit, alert_id, plan)
+    if s.mode == "LIVE":
+        if limit is None:
+            report["order_placed"] = False
+            report["error"] = "no option quote"
+            return report
+        body = order_body({"symbol": occ, "side": "SELL", "open_close": "CLOSE", "limit_price": limit, "qty": qty})
+        body["orderId"] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"public-relay:{alert_id}"))
+        try:
+            placed = await client.place(body)
+        except (httpx.HTTPError, RuntimeError) as exc:
+            report["order_placed"] = False
+            report["error"] = type(exc).__name__
+            return report
+        if placed.status_code >= 400:
+            report["order_placed"] = False
+            report["error"] = f"order failed ({placed.status_code})"
+            return report
+        await store.record_close(
+            symbol, "FlowVWAP", s.mode, occ, alert_id,
+            tp_status=plan["tp_status_after"], stop_status=plan["stop_status_after"],
+            tp_filled=plan["tp_filled"], stop_filled=plan["stop_filled"])
+        report["order_placed"] = True
+        report["limit"] = cents(limit)
+        return report
+    await store.record_close(
+        symbol, "FlowVWAP", s.mode, occ, alert_id,
+        tp_status=plan["tp_status_after"], stop_status=plan["stop_status_after"],
+        tp_filled=plan["tp_filled"], stop_filled=plan["stop_filled"])
+    report["order_placed"] = False
+    report["limit"] = None if limit is None else cents(limit)
+    report["note"] = "PREFLIGHT records the exit and does not send it"
+    return report
+
+
+async def _paper_flow_exit(report: dict, row: dict, alpaca: AlpacaClient, store: "Store", s: "Settings",
+                           occ: str, qty: int, limit: Decimal, alert_id: str, plan: dict) -> dict:
+    client_id = paper_client_id(f"flow-exit:{row.get('opened_alert_id')}")
+    existing = await alpaca.order_by_client(client_id)
+    if existing is None:
+        await cancel_paper_working(alpaca, row)
+        body = alpaca_limit_order(
+            alpaca_option_symbol(occ), qty, "sell", "sell_to_close", limit, client_id)
+        placed = await alpaca.place(body)
+    else:
+        body = {"client_order_id": client_id, "qty": str(qty), "limit_price": price_text(limit)}
+        placed = existing
+    reason = await store.record_close(
+        str(row.get("underlying") or ""), "FlowVWAP", s.mode, occ, alert_id,
+        tp_status=plan["tp_status_after"], stop_status=plan["stop_status_after"],
+        tp_filled=plan["tp_filled"], stop_filled=plan["stop_filled"])
+    report["order_placed"] = True
+    report["quantity"] = qty
+    report["limit"] = price_text(limit)
+    report["alpaca_order_id"] = placed.get("id")
+    report["idempotent"] = existing is not None
+    if reason and "no open position" not in reason:
+        report["error"] = reason
+    jlog("flowvwap_exit", action=report.get("action"), qty=qty, order_id=placed.get("id"),
+         idempotent=existing is not None, order=body)
+    return report
+
+
 # --------------------------------------------------------------------------- app
 def create_app(settings: Optional[Settings] = None,
                transport: Optional[httpx.AsyncBaseTransport] = None,
@@ -2627,6 +3059,8 @@ def create_app(settings: Optional[Settings] = None,
     store = Store(s.supabase_url, s.supabase_key, store_transport)
     client = PublicClient(s, transport)
     alpaca = AlpacaClient(s, alpaca_transport) if s.mode == "PAPER" else None
+    market_data = AlpacaData(s.alpaca_key_id, s.alpaca_secret_key, alpaca_transport) if (
+        s.alpaca_key_id and s.alpaca_secret_key) else None
     sleep = sleeper or asyncio.sleep
     app = FastAPI(title="public-relay")
 
@@ -2656,9 +3090,7 @@ def create_app(settings: Optional[Settings] = None,
     @app.get("/keepalive")
     async def keepalive(request: Request):
         # Vercel Cron sends "Authorization: Bearer $CRON_SECRET". Touches Supabase only, never Public.
-        secret = os.environ.get("CRON_SECRET", "")
-        auth = request.headers.get("authorization", "")
-        if not secret or not hmac.compare_digest(auth.encode(), f"Bearer {secret}".encode()):
+        if not cron_authorized(request):
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
         try:
             await store.ping()
@@ -2678,6 +3110,56 @@ def create_app(settings: Optional[Settings] = None,
             body["reconciled"] = reconciled
         return body
 
+    @app.post("/levels")
+    async def levels(request: Request):
+        # Nick's assistant posts the day's UW flip, King, and Daybreak bias. CRON_SECRET, not the webhook passphrase.
+        if not cron_authorized(request):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            payload = json.loads(await request.body())
+            if not isinstance(payload, dict):
+                raise ValueError
+        except ValueError:
+            return JSONResponse({"ok": False, "error": "body must be a JSON object"}, status_code=400)
+        symbol = str(payload.get("symbol") or "SPY").strip().upper()
+        if not UNDERLYING_RE.match(symbol):
+            return JSONResponse({"ok": False, "error": "symbol must be an underlying like SPY"}, status_code=422)
+        raw_day = str(payload.get("day") or clock().date().isoformat()).strip()
+        try:
+            day = date.fromisoformat(raw_day).isoformat()
+        except ValueError:
+            return JSONResponse({"ok": False, "error": "day must be YYYY-MM-DD"}, status_code=422)
+        flip = positive_price(payload.get("flip"))
+        king = positive_price(payload.get("king"))
+        bias = str(payload.get("daybreak_bias") or "").strip()
+        if flip is None or king is None or bias == "":
+            return JSONResponse(
+                {"ok": False, "error": "flip, king, and daybreak_bias are required"}, status_code=422)
+        try:
+            await store.upsert_levels(day, symbol, format(flip, "f"), format(king, "f"), bias)
+        except (StoreError, httpx.HTTPError) as exc:
+            jlog("levels_failed", error=type(exc).__name__)
+            return JSONResponse({"ok": False, "error": "store unavailable"}, status_code=503)
+        jlog("levels_saved", day=day, symbol=symbol, flip=format(flip, "f"), king=format(king, "f"),
+             daybreak_bias=bias)
+        return {"ok": True, "day": day, "symbol": symbol, "flip": format(flip, "f"),
+                "king": format(king, "f"), "daybreak_bias": bias}
+
+    @app.api_route("/flowvwap-monitor", methods=["GET", "POST"])
+    async def flowvwap_monitor(request: Request):
+        # Free outside timer. Not a Vercel cron. Idempotent: a second call does not sell again.
+        if not cron_authorized(request):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            report = await run_flow_monitor(clock(), s, store, client, alpaca, market_data)
+        except (StoreError, httpx.HTTPError) as exc:
+            jlog("flowvwap_monitor_failed", error=type(exc).__name__)
+            return JSONResponse({"ok": False, "error": "store unavailable"}, status_code=503)
+        except Reject as exc:
+            jlog("flowvwap_monitor_failed", error=exc.reason)
+            return JSONResponse({"ok": False, "error": exc.reason}, status_code=exc.status)
+        return report
+
     @app.post("/preflight")
     async def preflight(request: Request):
         # Same passphrase as /webhook. Selects and preflights only. Never places or persists.
@@ -2692,7 +3174,7 @@ def create_app(settings: Optional[Settings] = None,
         if not s.webhook_passphrase or not hmac.compare_digest(pw.encode(), s.webhook_passphrase.encode()):
             return respond(401, {"ok": False, "error": "unauthorized", "order_placed": False})
         try:
-            report = await run_readonly_preflight(payload, s, client, store, clock())
+            report = await run_readonly_preflight(payload, s, client, store, clock(), market_data)
         except Reject as exc:
             return respond(exc.status, {"ok": False, "error": exc.reason, "order_placed": False})
         except (StoreError, httpx.HTTPError) as exc:
@@ -2728,12 +3210,15 @@ def create_app(settings: Optional[Settings] = None,
         if s.mode == "PAPER":
             if alpaca is None:
                 return respond(503, {"ok": False, "alert_id": alert_id, "error": "Alpaca is not configured"})
-            return await run_paper_alert(payload, alert_id, day, now, s, store, client, alpaca, sleep, respond)
+            return await run_paper_alert(
+                payload, alert_id, day, now, s, store, client, alpaca, sleep, respond, market_data)
         releases: list[tuple] = []
         selection: Optional[dict] = None
         try:
             profile = s.for_strategy(strategy_name(payload))
-            order_payload, selection = await prepare_order(payload, profile, client, store, now)
+            order_payload, selection = await prepare_order(payload, profile, client, store, now, market_data)
+            if profile.flow_rules and selection is None and str(order_payload.get("open_close", "")).upper() == "OPEN":
+                raise Reject("FlowVWAP entries must use the underlying symbol, not an OCC symbol")
             if selection is not None and selection.get("skip_order"):
                 await store.log_pick(alert_id, day, s.mode, selection)
                 jlog("contract_pick", alert_id=alert_id, selection=selection)

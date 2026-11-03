@@ -50,7 +50,7 @@ class FakeSupabase:
 
     def __init__(self, fail=False, missing_position_rpc=False):
         self.alerts, self.counters, self.fail, self.calls = {}, {}, fail, []
-        self.positions, self.picks, self.exit_orders = {}, [], {}
+        self.positions, self.picks, self.exit_orders, self.levels = {}, [], {}, {}
         self.missing_position_rpc = missing_position_rpc
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
@@ -134,6 +134,10 @@ class FakeSupabase:
                 "entry_status": b.get("p_entry_status", "NONE"),
                 "entry_filled": b.get("p_entry_filled", 0),
                 "exits_placed": b.get("p_exits_placed") is True,
+                "entry_underlying": b.get("p_entry_underlying"),
+                "stop_underlying": b.get("p_stop_underlying"),
+                "target_underlying": b.get("p_target_underlying"),
+                "regime": b.get("p_regime"),
             }
             return httpx.Response(200, content=b"null", headers={"content-type": "application/json"})
         if p == "/rest/v1/rpc/relay_record_close":
@@ -183,6 +187,27 @@ class FakeSupabase:
                 "exits_placed": b.get("p_exits_placed") is True,
                 "qty_open": b.get("p_qty_open"),
             })
+            return httpx.Response(200, content=b"null", headers={"content-type": "application/json"})
+        if p == "/rest/v1/rpc/relay_get_levels":
+            row = self.levels.get((b["p_day"], b["p_symbol"]))
+            if not row:
+                return httpx.Response(200, content=b"null", headers={"content-type": "application/json"})
+            return httpx.Response(200, json=row)
+        if p == "/rest/v1/rpc/relay_upsert_levels":
+            key = (b["p_day"], b["p_symbol"])
+            row = self.levels.setdefault(key, {"day": key[0], "symbol": key[1]})
+            row["flip"] = b.get("p_flip")
+            row["king"] = b.get("p_king")
+            row["daybreak_bias"] = b.get("p_daybreak_bias")
+            return httpx.Response(200, content=b"null", headers={"content-type": "application/json"})
+        if p == "/rest/v1/rpc/relay_save_session":
+            key = (b["p_day"], b["p_symbol"])
+            row = self.levels.setdefault(key, {"day": key[0], "symbol": key[1]})
+            if b.get("p_open_930") not in (None, ""):
+                row["open_930"] = b.get("p_open_930")
+            if b.get("p_prior_rth_low") not in (None, ""):
+                row["prior_rth_low"] = b.get("p_prior_rth_low")
+            row["session_source"] = b.get("p_session_source")
             return httpx.Response(200, content=b"null", headers={"content-type": "application/json"})
         if p == "/rest/v1/contract_picks" and req.method == "POST":
             self.picks.append(b)
@@ -569,7 +594,7 @@ class StatusPublic(ChainPublic):
 def underlying(**kw):
     base = {
         "passphrase": PASS, "symbol": "SPY", "side": "buy", "qty": 1, "underlying_price": "580",
-        "strategy": "FlowVWAP", "alert_id": "spy-1", "market_position": "long", "prev_market_position": "flat",
+        "strategy": "Tape", "alert_id": "spy-1", "market_position": "long", "prev_market_position": "flat",
     }
     base.update(kw)
     return base
@@ -583,7 +608,7 @@ def flatten_alert(alert_id):
     return underlying(qty=99, side="sell", market_position="flat", prev_market_position="long", alert_id=alert_id)
 
 
-def saved_position(client, mode="PREFLIGHT", strategy="FlowVWAP"):
+def saved_position(client, mode="PREFLIGHT", strategy="Tape"):
     return client.sb.positions[("SPY", strategy, mode)]
 
 
@@ -655,7 +680,7 @@ def test_underlying_buy_selects_call_and_stays_preflight(tmp_path):
     assert pick["underlying_price"] == "580" and pick["candidates"]
     assert c.sb.alerts["spy-1"]["status"] == "ACCEPTED"
     assert c.sb.alerts["spy-1"]["detail"]["selection"]["chosen_symbol"] == CHOSEN_CALL
-    pos = c.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]
+    pos = c.sb.positions[("SPY", "Tape", "PREFLIGHT")]
     assert pos["status"] == "OPEN" and pos["symbol"] == CHOSEN_CALL
     assert pos["entry_side"] == "BUY" and pos["right_side"] == "C" and pos["qty"] == 1
     assert PASS not in r.text and "passphrase" not in json.dumps(pick)
@@ -688,7 +713,7 @@ def test_sell_selects_put(tmp_path):
     assert Decimal(sel["delta"]) == Decimal("-0.55")
     assert sel["limit"] == "1.30" and sel["limit_source"] == "mid"
     assert r.json()["order"]["orderSide"] == "BUY" and r.json()["order"]["openCloseIndicator"] == "OPEN"
-    pos = c.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]
+    pos = c.sb.positions[("SPY", "Tape", "PREFLIGHT")]
     assert pos["entry_side"] == "SELL" and pos["right_side"] == "P" and pos["symbol"] == CHOSEN_PUT
     assert not ending(fake, "/order")
 
@@ -736,7 +761,7 @@ def test_flatten_and_opposite_side_close_stored_contract(tmp_path):
     assert r.json()["order"]["openCloseIndicator"] == "CLOSE"
     assert r.json()["order"]["quantity"] == "1"  # stored qty, not the alert's 99
     assert r.json()["order"]["limitPrice"] == "1.20"
-    assert c.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["status"] == "CLOSED"
+    assert c.sb.positions[("SPY", "Tape", "PREFLIGHT")]["status"] == "CLOSED"
     assert len(ending(fake, "/option-chain")) == 1  # the close quotes the stored contract
     assert not ending(fake, "/order")
     # A second flatten has nothing left to close.
@@ -759,7 +784,7 @@ def test_flatten_and_opposite_side_close_stored_contract(tmp_path):
     r = c.post("/webhook", json=rev)
     assert r.json()["selection"]["intent"] == "reversal"
     assert r.json()["order"]["instrument"]["symbol"] == CHOSEN_CALL
-    assert c.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["status"] == "CLOSED"
+    assert c.sb.positions[("SPY", "Tape", "PREFLIGHT")]["status"] == "CLOSED"
 
 
 def test_close_falls_back_to_bid(tmp_path):
@@ -893,7 +918,14 @@ def test_settings_defaults_overrides_and_live_gate():
     defaults = relay.Settings.from_env({})
     assert defaults.mode == "PREFLIGHT"
     assert defaults.allowlist == {"QQQ"}
-    assert defaults.for_strategy("FlowVWAP") is defaults
+    assert defaults.for_strategy("Tape") is defaults
+    flow_defaults = defaults.for_strategy("FlowVWAP")
+    assert flow_defaults is not defaults
+    assert flow_defaults.delta_band_min == Decimal("0.50") and flow_defaults.delta_band_max == Decimal("0.60")
+    assert flow_defaults.itm_points == Decimal("0.50") and flow_defaults.max_premium is None
+    assert flow_defaults.max_qty == 5 and flow_defaults.order_qty == 5 and flow_defaults.flow_rules is True
+    assert flow_defaults.stop_loss_percent is None
+    assert flow_defaults.max_orders_per_day == defaults.max_orders_per_day
     qqq_defaults = defaults.for_strategy("QQQ_EMA_VWAP")
     assert qqq_defaults.delta_band_min == Decimal("0.60") and qqq_defaults.delta_band_max == Decimal("0.75")
     assert qqq_defaults.itm_points == Decimal("5") and qqq_defaults.max_premium == Decimal("5.00")
@@ -978,9 +1010,12 @@ def test_settings_defaults_overrides_and_live_gate():
         relay.limit_from_market(None, Decimal("1.37"), "reject")
     assert relay.limit_from_market(Decimal("1.11"), None, "bid") == (Decimal("1.11"), "bid")
     held = relay.Settings.from_env({"STOP_LOSS_PERCENT": "30", "TP_SINGLE": "true", "MAX_QTY": "4", "TP_PERCENT": "15"})
-    assert held.for_strategy("FlowVWAP").stop_loss_percent == Decimal("30")
-    assert held.for_strategy("FlowVWAP").tp_single is True and held.for_strategy("FlowVWAP").max_qty == 4
-    assert held.for_strategy("FlowVWAP").tp_percent == Decimal("15")
+    assert held.for_strategy("Tape").stop_loss_percent == Decimal("30")
+    assert held.for_strategy("Tape").tp_single is True and held.for_strategy("Tape").max_qty == 4
+    assert held.for_strategy("Tape").tp_percent == Decimal("15")
+    assert held.for_strategy("FlowVWAP").stop_loss_percent is None
+    assert held.for_strategy("FlowVWAP").max_qty == 5 and held.for_strategy("FlowVWAP").order_qty == 5
+    assert held.for_strategy("FlowVWAP").max_premium is None and held.for_strategy("FlowVWAP").flow_rules is True
     qqq_held = held.for_strategy("QQQ_EMA_VWAP")
     assert qqq_held.stop_loss_percent is None and qqq_held.tp_single is True and qqq_held.max_qty == 1
     assert qqq_held.tp_percent == Decimal("50")
@@ -994,7 +1029,13 @@ def test_settings_defaults_overrides_and_live_gate():
     assert merged.for_strategy("Other").tp_percent == Decimal("10")
     assert merged.for_strategy("Other").max_premium == Decimal("2.00")
     assert merged.public_view()["strategies"]["Other"]["tp_percent"] == "10"
-    assert merged.for_strategy("FlowVWAP").max_premium == Decimal("2.00")
+    assert merged.for_strategy("FlowVWAP").max_premium is None
+    capped = relay.Settings.from_env({
+        "STRATEGY_OVERRIDES": '{"FlowVWAP": {"max_premium": "3.00"}}',
+        "MAX_PREMIUM": "2.00",
+    })
+    assert capped.for_strategy("FlowVWAP").max_premium == Decimal("3.00")
+    assert capped.for_strategy("FlowVWAP").order_qty == 5 and capped.for_strategy("FlowVWAP").itm_points == Decimal("0.50")
     assert PASS not in json.dumps(merged.public_view())
     with pytest.raises(ValueError):
         relay.Settings.from_env({"STRATEGY_OVERRIDES": "[]"})
@@ -1022,7 +1063,11 @@ def test_health_lists_tunables(tmp_path):
     assert qqq["delta_band_min"] == "0.60" and qqq["delta_band_max"] == "0.75"
     assert qqq["itm_points"] == "5" and qqq["max_premium"] == "5.00" and qqq["max_qty"] == 1
     assert qqq["tp_percent"] == "50" and qqq["tp_single"] is True and qqq["stop_loss_percent"] is None
-    assert "FlowVWAP" not in settings["strategies"]
+    flow = settings["strategies"]["FlowVWAP"]
+    assert flow["delta_band_min"] == "0.50" and flow["delta_band_max"] == "0.60"
+    assert flow["itm_points"] == "0.50" and flow["max_premium"] is None
+    assert flow["max_qty"] == 5 and flow["order_qty"] == 5 and flow["flow_rules"] is True
+    assert flow["stop_loss_percent"] is None
     assert PASS not in json.dumps(settings) and "secret" not in json.dumps(settings)
     health = c.get("/health").json()
     assert health["mode"] == "PREFLIGHT" and health["alpaca_configured"] is False and "alpaca" not in health
@@ -1094,7 +1139,7 @@ def test_partial_take_profit_and_runner_flatten(tmp_path, caplog):
     assert json.loads(preflights[0].content)["openCloseIndicator"] == "OPEN"
     tp_request = json.loads(preflights[1].content)
     assert tp_request["limitPrice"] == "1.74" and "orderId" not in tp_request
-    pos = c.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]
+    pos = c.sb.positions[("SPY", "Tape", "PREFLIGHT")]
     assert pos["qty"] == 4 and pos["qty_open"] == 4 and pos["tp_qty"] == 2
     assert pos["tp_status"] == "RESTING" and pos["tp_order_id"] == tp["orderId"]
     assert pos["entry_limit"] == "1.45" and pos["tp_limit"] == "1.74"
@@ -1113,7 +1158,7 @@ def test_partial_take_profit_and_runner_flatten(tmp_path, caplog):
     assert closed["cancel_take_profit"]["quantity"] == 2
     assert "included in this sell-to-close" in closed["cancel_take_profit"]["note"]
     assert "included in this sell-to-close" in closed["note"]
-    saved = c.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]
+    saved = c.sb.positions[("SPY", "Tape", "PREFLIGHT")]
     assert saved["status"] == "CLOSED" and saved["tp_status"] == "CANCELLED" and saved["qty_open"] == 0
     assert len(ending(fake, "/preflight/single-leg")) == 3
     assert not ending(fake, "/order")
@@ -1160,7 +1205,7 @@ def test_tp_single_flatten_cancels_and_sells(tmp_path):
     assert len(ending(fake, "/preflight/single-leg")) == 3
     assert ending(fake, "/quotes")
     assert not ending(fake, "/order")
-    saved = c.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]
+    saved = c.sb.positions[("SPY", "Tape", "PREFLIGHT")]
     assert saved["status"] == "CLOSED" and saved["tp_status"] == "CANCELLED" and saved["qty_open"] == 0
 
 
@@ -1237,7 +1282,7 @@ def test_take_profit_preflight_failure_keeps_the_entry(tmp_path):
     assert r.status_code == 200, r.text
     tp = r.json()["take_profit"]
     assert tp["attached"] is False and tp["reason"] == "preflight failed" and tp["preflight_status"] == 400
-    pos = c.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]
+    pos = c.sb.positions[("SPY", "Tape", "PREFLIGHT")]
     assert pos["status"] == "OPEN" and pos["qty"] == 2 and pos["qty_open"] == 2 and pos["tp_status"] == "NONE"
     assert c.sb.exit_orders.get(("2026-10-19", "PREFLIGHT"), 0) == 0
     assert c.sb.counters[("2026-10-19", "PREFLIGHT")][0] == 1
@@ -1545,7 +1590,7 @@ def test_paper_rejects_a_missing_contract_without_an_order(tmp_path):
     assert response.status_code == 422, response.text
     assert CHOSEN_CALL in response.json()["error"]
     assert broker.posts() == []
-    assert ("SPY", "FlowVWAP", "PAPER") not in client.sb.positions
+    assert ("SPY", "Tape", "PAPER") not in client.sb.positions
     assert client.sb.counters.get(("2026-10-19", "PAPER"), [0])[0] == 0
     assert not ending(public, "/order") and not ending(public, "/preflight/single-leg")
 
@@ -1797,7 +1842,7 @@ def two_chains(quotes=None, calls=CALLS):
     )
 
 
-def test_flowvwap_unchanged_and_qqq_uses_its_profile(tmp_path):
+def test_unlisted_strategy_follows_env_and_qqq_uses_its_profile(tmp_path):
     public = two_chains()
     client, fake = make(tmp_path, public=public, MAX_QTY="4", MAX_DAILY_OPENS="5000",
                         STOP_LOSS_PERCENT="30", TP_PERCENT="15", TP_SINGLE="false")
@@ -1809,7 +1854,7 @@ def test_flowvwap_unchanged_and_qqq_uses_its_profile(tmp_path):
     assert spy_body["selection"]["limit"] == "1.45"
     assert spy_body["take_profit"]["attached"] is False
     assert spy_body["stop"]["attached"] is True and spy_body["stop"]["stop_price"] == "1.02"
-    assert client.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["status"] == "OPEN"
+    assert client.sb.positions[("SPY", "Tape", "PREFLIGHT")]["status"] == "OPEN"
 
     blocked_qty = client.post("/webhook", json=qqq_alert(alert_id="qqq-qty", qty=2))
     assert blocked_qty.status_code == 422 and "MAX_QTY" in blocked_qty.json()["error"]
@@ -1828,7 +1873,7 @@ def test_flowvwap_unchanged_and_qqq_uses_its_profile(tmp_path):
     saved = client.sb.positions[("QQQ", "QQQ_EMA_VWAP", "PREFLIGHT")]
     assert saved["status"] == "OPEN" and saved["symbol"] == QQQ_CALL and saved["tp_status"] == "RESTING"
     assert saved["stop_status"] == "NONE"
-    assert client.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["status"] == "OPEN"
+    assert client.sb.positions[("SPY", "Tape", "PREFLIGHT")]["status"] == "OPEN"
     assert not ending(fake, "/order")
 
     missing = client.post("/webhook", json=underlying(symbol="IWM", strategy="QQQ_EMA_VWAP", alert_id="iwm"))
@@ -1853,7 +1898,7 @@ def test_flatten_stays_on_its_ticker_and_strategy(tmp_path):
         symbol="SPY", side="sell", market_position="flat", prev_market_position="long",
         alert_id="spy-as-qqq", qty=99))
     assert wrong_ticker.status_code == 422 and "no open position" in wrong_ticker.json()["error"]
-    assert client.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["status"] == "OPEN"
+    assert client.sb.positions[("SPY", "Tape", "PREFLIGHT")]["status"] == "OPEN"
     assert client.sb.positions[("QQQ", "QQQ_EMA_VWAP", "PREFLIGHT")]["status"] == "OPEN"
 
     flat_qqq = client.post("/webhook", json=qqq_alert(
@@ -1862,19 +1907,19 @@ def test_flatten_stays_on_its_ticker_and_strategy(tmp_path):
     assert flat_qqq.json()["selection"]["chosen_symbol"] == QQQ_CALL
     assert flat_qqq.json()["order"]["quantity"] == "1" and flat_qqq.json()["order"]["openCloseIndicator"] == "CLOSE"
     assert client.sb.positions[("QQQ", "QQQ_EMA_VWAP", "PREFLIGHT")]["status"] == "CLOSED"
-    assert client.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["status"] == "OPEN"
-    assert client.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["symbol"] == CHOSEN_CALL
+    assert client.sb.positions[("SPY", "Tape", "PREFLIGHT")]["status"] == "OPEN"
+    assert client.sb.positions[("SPY", "Tape", "PREFLIGHT")]["symbol"] == CHOSEN_CALL
 
     flat_spy = client.post("/webhook", json=flatten_alert("spy-flat"))
     assert flat_spy.status_code == 200, flat_spy.text
     assert flat_spy.json()["selection"]["chosen_symbol"] == CHOSEN_CALL
-    assert client.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["status"] == "CLOSED"
+    assert client.sb.positions[("SPY", "Tape", "PREFLIGHT")]["status"] == "CLOSED"
     assert client.sb.positions[("QQQ", "QQQ_EMA_VWAP", "PREFLIGHT")]["status"] == "CLOSED"
     assert not ending(fake, "/order")
 
 
 def test_premium_cap_never_blocks_a_close(tmp_path):
-    # Global cap is pinned at 2.00 so FlowVWAP and the QQQ profile differ. The code default is 5.00.
+    # Global cap is pinned at 2.00. Tape follows it. QQQ's profile is 5.00. FlowVWAP's cap is off.
     client, _fake = make(tmp_path, MAX_PREMIUM="2.00", MAX_DAILY_OPENS="5000", MAX_ORDERS_PER_DAY="10")
     opened = client.post("/webhook", json=alert(
         symbol="QQQ261120C00480000", limit_price="5.00", strategy="QQQ_EMA_VWAP", alert_id="q-open"))
@@ -1883,7 +1928,7 @@ def test_premium_cap_never_blocks_a_close(tmp_path):
         symbol="QQQ261120C00480000", limit_price="5.01", strategy="QQQ_EMA_VWAP", alert_id="q-rich"))
     assert rich.status_code == 422 and "MAX_PREMIUM" in rich.json()["error"]
     spy_rich = client.post("/webhook", json=alert(
-        symbol="SPY261120C00480000", limit_price="2.01", strategy="FlowVWAP", alert_id="spy-rich"))
+        symbol="SPY261120C00480000", limit_price="2.01", strategy="Tape", alert_id="spy-rich"))
     assert spy_rich.status_code == 422 and "MAX_PREMIUM" in spy_rich.json()["error"]
     qqq_close = client.post("/webhook", json=alert(
         symbol="QQQ261120C00480000", side="SELL", open_close="CLOSE", limit_price="9.00",
@@ -1892,7 +1937,7 @@ def test_premium_cap_never_blocks_a_close(tmp_path):
     assert qqq_close.json()["order_placed"] is False
     spy_close = client.post("/webhook", json=alert(
         symbol="SPY261120C00480000", side="SELL", open_close="CLOSE", limit_price="9.00",
-        strategy="FlowVWAP", alert_id="spy-close"))
+        strategy="Tape", alert_id="spy-close"))
     assert spy_close.status_code == 200, spy_close.text
 
     quotes = {QQQ_CALL: option_quote(QQQ_CALL, "8.80", "9.20")}
@@ -1916,14 +1961,14 @@ def test_daily_caps_stay_shared_across_strategies(tmp_path):
     assert third.status_code == 422 and "MAX_ORDERS_PER_DAY" in third.json()["error"]
     assert client.sb.counters[("2026-10-19", "PREFLIGHT")][0] == 2
     assert ("SPY", "Extra", "PREFLIGHT") not in client.sb.positions
-    assert client.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["status"] == "OPEN"
+    assert client.sb.positions[("SPY", "Tape", "PREFLIGHT")]["status"] == "OPEN"
     assert client.sb.positions[("QQQ", "QQQ_EMA_VWAP", "PREFLIGHT")]["status"] == "OPEN"
 
     spend, _fake = make(tmp_path / "spend", public=two_chains(), MAX_DAILY_OPENS="200", MAX_ORDERS_PER_DAY="10")
     assert spend.post("/webhook", json=underlying(alert_id="spy-spend")).status_code == 200
     blocked = spend.post("/webhook", json=qqq_alert(alert_id="qqq-spend"))
     assert blocked.status_code == 422 and "spend cap" in blocked.json()["error"]
-    assert spend.sb.positions[("SPY", "FlowVWAP", "PREFLIGHT")]["status"] == "OPEN"
+    assert spend.sb.positions[("SPY", "Tape", "PREFLIGHT")]["status"] == "OPEN"
     assert ("QQQ", "QQQ_EMA_VWAP", "PREFLIGHT") not in spend.sb.positions
     assert spend.sb.counters[("2026-10-19", "PREFLIGHT")][1] == Decimal("145.00")
 
@@ -1960,12 +2005,12 @@ def test_paper_qqq_profile_and_close_ignores_the_premium_cap(tmp_path):
     assert flat.json()["order_placed"] is True and flat.json()["order"]["limit_price"] == "9.20"
     assert Decimal(flat.json()["order"]["limit_price"]) > Decimal("5")
     assert client.sb.positions[("QQQ", "QQQ_EMA_VWAP", "PAPER")]["status"] == "CLOSED"
-    assert client.sb.positions[("SPY", "FlowVWAP", "PAPER")]["status"] == "OPEN"
+    assert client.sb.positions[("SPY", "Tape", "PAPER")]["status"] == "OPEN"
 
     spy_flat = client.post("/webhook", json=flatten_alert("spy-paper-flat"))
     assert spy_flat.status_code == 200, spy_flat.text
     assert spy_flat.json()["order"]["limit_price"] == "8.20"
-    assert client.sb.positions[("SPY", "FlowVWAP", "PAPER")]["status"] == "CLOSED"
+    assert client.sb.positions[("SPY", "Tape", "PAPER")]["status"] == "CLOSED"
     assert not ending(public, "/order")
     blob = flat.text + spy_flat.text
     assert "alpaca-secret" not in blob and "alpaca-key" not in blob and PASS not in blob
