@@ -18,6 +18,9 @@
   The position key is underlying + strategy + mode, so a QQQ flatten cannot close a SPY position.
   `QQQ_EMA_VWAP` keeps its own selection and exit defaults. `FlowVWAP` has its own profile
   (delta 0.50–0.60, 0.50 points ITM, 5 contracts, no premium cap, underlying exits).
+  `PremarketES` has its own profile (delta 0.35–0.40, ATM through 5 points OTM, 5 contracts,
+  no take-profit and no option stop). A close alert flattens that position. It does not use
+  the FlowVWAP monitor.
   `0006_flowvwap_levels.sql` adds the entry underlying prices and `daily_levels`. Apply it
   after `0005` before this version serves FlowVWAP. QQQ opens still record if the new
   columns are left null.
@@ -67,19 +70,20 @@ are unchanged: LIVE still requires both `MODE=LIVE` and `LIVE_CONFIRM=I_UNDERSTA
 | `SUPABASE_SERVICE_KEY` | empty | Service-role key. Server only. |
 | `CRON_SECRET` | empty | Bearer token for `GET /keepalive`. |
 
-`/health` returns every tunable above except the secrets. `settings.strategies` is the effective per-strategy block (built-in profiles plus `STRATEGY_OVERRIDES`). A strategy that is not listed there uses the global `settings` values. `FlowVWAP` and `QQQ_EMA_VWAP` are both listed. `settings.daily_caps` is `shared`.
+`/health` returns every tunable above except the secrets. `settings.strategies` is the effective per-strategy block (built-in profiles plus `STRATEGY_OVERRIDES`). A strategy that is not listed there uses the global `settings` values. `FlowVWAP`, `QQQ_EMA_VWAP`, and `PremarketES` are listed. `settings.daily_caps` is `shared`.
 
 ## Per-strategy settings
 
 Checked-in defaults live in `BUILTIN_STRATEGY_OVERRIDES` in `api/index.py`. That is the source that ships without an env edit. `STRATEGY_OVERRIDES` is optional JSON and replaces individual keys for a strategy; omitted keys keep the built-in value, then the global env. The strategy name must match the alert's `strategy` field exactly. No Vercel variable has to change for `QQQ_EMA_VWAP`.
 
-Overridable keys: `delta_band_min`, `delta_band_max`, `itm_points`, `max_premium`, `tp_percent`, `tp_single`, `stop_loss_percent`, `max_qty`, `order_qty`, `flow_rules`. `max_premium: null` removes that strategy's open cap. Daily caps, expiry, limit fallbacks, and mode are not overridable.
+Overridable keys: `delta_band_min`, `delta_band_max`, `itm_points`, `otm_points`, `max_premium`, `tp_percent`, `tp_single`, `take_profit`, `stop_loss_percent`, `max_qty`, `order_qty`, `flow_rules`. `max_premium: null` removes that strategy's open cap. `otm_points` is how far out of the money a strike may be (0–50). `0` keeps the ATM-through-ITM window. `take_profit: false` skips the premium take-profit for that strategy, including a 5-lot, which `TP_FRACTION` cannot do from a profile. Daily caps, expiry, limit fallbacks, and mode are not overridable.
 
-| Strategy | Delta | ITM | Max premium (opens) | Exits | Qty |
+| Strategy | Delta | Strike window | Max premium (opens) | Exits | Qty |
 | --- | --- | --- | --- | --- | --- |
-| `FlowVWAP` | `0.50`–`0.60` | `0.50` | none (`null`) | SPY underlying stop 0.50 / target +1.00, whole position. No premium take-profit or stop. | 5 (`order_qty`) |
-| `QQQ_EMA_VWAP` | `0.60`–`0.75` | `5` | `5.00` | `50%` take-profit, `TP_SINGLE` on, premium stop off | `1` |
-| any other name | global `0.50`–`0.60` | global `5` | global `MAX_PREMIUM` | global premium take-profit and stop | global `MAX_QTY` |
+| `FlowVWAP` | `0.50`–`0.60` | ATM through `0.50` ITM | none (`null`) | SPY underlying stop 0.50 / target +1.00, whole position. No premium take-profit or stop. | 5 (`order_qty`) |
+| `QQQ_EMA_VWAP` | `0.60`–`0.75` | ATM through `5` ITM | `5.00` | `50%` take-profit, `TP_SINGLE` on, premium stop off | `1` |
+| `PremarketES` | `0.35`–`0.40` | ATM through `5` OTM | global `MAX_PREMIUM` | Close alert flattens the whole position. No take-profit, no option stop. | 5 (`order_qty`) |
+| any other name | global `0.50`–`0.60` | ATM through global `ITM_POINTS` | global `MAX_PREMIUM` | global premium take-profit and stop | global `MAX_QTY` |
 
 Example, only if a shipped value needs a change (not required):
 
@@ -87,7 +91,19 @@ Example, only if a shipped value needs a change (not required):
 {"QQQ_EMA_VWAP": {"max_premium": "6.00", "stop_loss_percent": null}}
 ```
 
-Daily caps stay shared on `(day, mode)`, which is how `daily_counters` already works. `MAX_ORDERS_PER_DAY` (3) and `MAX_DAILY_OPENS` (code default 1500; production sets 1000) count FlowVWAP and QQQ together. A FlowVWAP open of 5 contracts spends `limit × 5 × 100` of that same pool. Splitting the caps would raise the loss limit, so they stay one pool. Positions do not: each open row is `(underlying, strategy, mode)`.
+Daily caps stay shared on `(day, mode)`, which is how `daily_counters` already works. `MAX_ORDERS_PER_DAY` (3) and `MAX_DAILY_OPENS` (code default 1500; production sets 1000) count FlowVWAP, QQQ, and PremarketES together. A 5-contract open spends `limit × 5 × 100` of that same pool. Splitting the caps would raise the loss limit, so they stay one pool. Positions do not: each open row is `(underlying, strategy, mode)`.
+
+## PremarketES (SPY 0DTE)
+
+Checked-in defaults in `BUILTIN_STRATEGY_OVERRIDES`. A long alert buys a call and a short alert buys a put. Absolute delta is 0.35–0.40, from ATM through 5 points out of the money in the trade's direction. Strikes in the money are not candidates. That is the slightly OTM contract. FlowVWAP and `QQQ_EMA_VWAP` stay ATM through ITM; `otm_points` is 0 for both.
+
+Quantity is 5 (`order_qty`). The alert's `qty` and the global `MAX_QTY` are not used. Opens still use the global `MAX_PREMIUM`. There is no premium take-profit (`take_profit: false`) and no relay-side option stop (`stop_loss_percent: null`), even when `STOP_LOSS_PERCENT` or `TP_PERCENT` is set for other strategies.
+
+`flow_rules` is false. PremarketES does not check the regime, the flip, the King room, or the 09:30–11:30 window, and it has no +1.00 underlying target. `GET` or `POST /flowvwap-monitor` skips these positions. Entries use the existing weekday 09:31–15:55 ET webhook window. An alert at 09:30 is rejected. An alert at 11:45 is allowed.
+
+The Pine script owns the $0.50 SPY stop and the 10:00 ET flatten. It sends a close alert (market position flat). The relay sells every contract still open for that `(underlying, strategy, mode)` row, the same way it flattens FlowVWAP and QQQ. A PremarketES close does not sell a FlowVWAP position, and the FlowVWAP monitor does not sell a PremarketES position.
+
+No env edit and no migration. `SPY` is already on the allowlist. `MODE` stays wherever it already is. This profile places on Alpaca only when that mode is already `PAPER`.
 
 The FlowVWAP monitor sells the whole position and does not consume `MAX_ORDERS_PER_DAY` or `MAX_EXIT_ORDERS_PER_DAY`, so a full exit cap cannot block the 11:30 flatten.
 
@@ -149,7 +165,7 @@ And once around 09:15 ET, after the levels file is written, post `/levels` with 
 
 ## Read-only preflight
 
-`POST /preflight` takes the same alert JSON and the same passphrase as `/webhook`. It selects the contract with that strategy's settings (`FlowVWAP` and `QQQ_EMA_VWAP` each use their profile), then calls Public.com `preflight/single-leg`. The response has `contract`, `premium`, `delta`, and `passed`. FlowVWAP preflight still applies the flip, regime, and room checks. It does not apply the 09:30–11:30 clock, so a check after the close can still return the pick.
+`POST /preflight` takes the same alert JSON and the same passphrase as `/webhook`. It selects the contract with that strategy's settings (`FlowVWAP`, `QQQ_EMA_VWAP`, and `PremarketES` each use their profile), then calls Public.com `preflight/single-leg`. The response has `contract`, `premium`, `delta`, and `passed`. FlowVWAP preflight still applies the flip, regime, and room checks. It does not apply the 09:30–11:30 clock, so a check after the close can still return the pick. PremarketES preflight uses the 0.35–0.40 OTM window and does not apply those FlowVWAP checks.
 
 It does not place an order on Public or Alpaca, does not write a position or order row, and does not count toward the daily caps. It ignores the market-hours window, so a check after the close still returns the pick. `/webhook` still rejects outside 09:31–15:55 ET.
 
@@ -206,7 +222,7 @@ What PAPER does:
 
 ## TradingView alert message
 
-Paste one object into the strategy alert **Message** box. Replace only the passphrase placeholder. Leave `open_close` off so the relay infers open vs close from `market_position` / `prev_market_position`. FlowVWAP ignores the alert quantity and buys 5. `QQQ_EMA_VWAP` sells its one contract at the 50% take-profit (`TP_SINGLE`).
+Paste one object into the strategy alert **Message** box. Replace only the passphrase placeholder. Leave `open_close` off so the relay infers open vs close from `market_position` / `prev_market_position`. FlowVWAP and PremarketES ignore the alert quantity and buy 5. `QQQ_EMA_VWAP` sells its one contract at the 50% take-profit (`TP_SINGLE`). The same PremarketES message is the close: when the script goes flat, `market_position` is `flat` and the relay sells all 5 contracts.
 
 FlowVWAP, usually on SPY:
 
@@ -224,7 +240,23 @@ FlowVWAP, usually on SPY:
 }
 ```
 
-QQQ_EMA_VWAP. The `strategy` value has to be exactly `QQQ_EMA_VWAP`. Any other name uses the global settings, not the FlowVWAP profile.
+PremarketES, on SPY. The `strategy` value has to be exactly `PremarketES`. Chart SPY. Entries are 09:31 ET or later. The script's close (the $0.50 SPY stop, and the 10:00 ET flatten) uses this same message.
+
+```json
+{
+  "passphrase": "REPLACE_WITH_WEBHOOK_PASSPHRASE",
+  "symbol": "{{ticker}}",
+  "side": "{{strategy.order.action}}",
+  "qty": "{{strategy.order.contracts}}",
+  "underlying_price": "{{close}}",
+  "market_position": "{{strategy.market_position}}",
+  "prev_market_position": "{{strategy.prev_market_position}}",
+  "strategy": "PremarketES",
+  "alert_id": "{{ticker}}-{{strategy.order.id}}-{{timenow}}"
+}
+```
+
+QQQ_EMA_VWAP. The `strategy` value has to be exactly `QQQ_EMA_VWAP`. Any other name uses the global settings, not the FlowVWAP or PremarketES profile.
 
 ```json
 {
@@ -268,6 +300,6 @@ How the research was done (`research/`, stdlib Python only):
 - Data came from the Robinhood MCP (`get_equity_historicals`, `get_index_historicals`, `get_option_instruments` with `state=expired`, `get_option_historicals`). The plan called for the Alpaca MCP, but its sign-in timed out, and Robinhood serves expired 0DTE contracts. `fetch_data.py` prints the calls still needed and ingests the saved responses into `research/data/` (git-ignored).
 - `pricing.py` fits a per-timestamp implied-vol smile to real marks for five near-the-money 0DTE contracts per underlying and day, then prices whatever strike the relay would pick. Leave-one-out error against real marks: median $0.02–$0.06.
 - `backtest.py` follows the relay: `choose_leg` ranking, mid-price limit, flatten-only reversals, TP_SINGLE take-profit, stop-limit, the PAPER cutoff and 15:40 flatten, and `MAX_PREMIUM` on opens only. `python research/backtest.py` reruns the grid in a few seconds; `pytest -q research/tests` covers the fill logic.
-- Bands below 0.50 delta need OTM strikes. The relay only picks ATM through `ITM_POINTS` in the money, so those bands were simulated with a 5-point OTM window and would need a relay change to trade.
+- Bands below 0.50 delta need OTM strikes. The research grid simulated those with a 5-point OTM window. `PremarketES` is the relay profile that trades that window (delta 0.35–0.40, ATM through 5 points OTM). FlowVWAP and `QQQ_EMA_VWAP` still pick ATM through ITM.
 
 Those selection and exit values are the checked-in `QQQ_EMA_VWAP` profile. Do not copy them onto FlowVWAP or onto the global env. `QQQ` is already on the allowlist. Leave `MODE`, `LIVE_CONFIRM`, and the production `MAX_DAILY_OPENS=1000` as they are.
