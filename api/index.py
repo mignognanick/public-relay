@@ -9,7 +9,8 @@ A full OCC symbol is forwarded as sent. An underlying such as SPY selects a call
 Positions are one row per underlying + strategy + mode, so a QQQ flatten cannot close SPY.
 Per-strategy selection and exit overrides live in BUILTIN_STRATEGY_OVERRIDES; STRATEGY_OVERRIDES
 (JSON) replaces individual keys. FlowVWAP uses underlying exits and a 09:30-11:30 window.
-QQQ_EMA_VWAP keeps its premium take-profit profile. Daily order and spend caps stay shared.
+QQQ_EMA_VWAP keeps its premium take-profit profile. PremarketES buys a slightly OTM SPY
+contract and flattens only when its own close alert arrives. Daily order and spend caps stay shared.
 Selection stays on Public.com. PAPER then checks the OCC symbol at Alpaca and places the entry,
 take-profit, and optional stop there. LIVE still places only the order under consideration.
 """
@@ -131,6 +132,8 @@ STRATEGY_OVERRIDE_KEYS = (
     "max_qty",
     "order_qty",
     "flow_rules",
+    "otm_points",
+    "take_profit",
 )
 # Checked-in defaults. An absent strategy uses the global env. STRATEGY_OVERRIDES merges per key
 # on top of these. QQQ_EMA_VWAP is unchanged. FlowVWAP no longer inherits the global profile.
@@ -156,6 +159,20 @@ BUILTIN_STRATEGY_OVERRIDE_RAW: dict[str, dict[str, Any]] = {
         "order_qty": 5,
         "stop_loss_percent": None,
         "flow_rules": True,
+    },
+    # SPY 0DTE. Absolute delta 0.35-0.40, from ATM through 5 points OTM (no ITM).
+    # Five contracts. The Pine close alert flattens the position. No premium take-profit
+    # or option stop, and none of the FlowVWAP session rules.
+    "PremarketES": {
+        "delta_band_min": "0.35",
+        "delta_band_max": "0.40",
+        "itm_points": "0",
+        "otm_points": "5",
+        "max_qty": 5,
+        "order_qty": 5,
+        "stop_loss_percent": None,
+        "take_profit": False,
+        "flow_rules": False,
     },
 }
 
@@ -208,6 +225,9 @@ def _parse_override_fields(name: str, fields: Any, source: str) -> dict[str, Any
     if "itm_points" in fields:
         parsed["itm_points"] = _bounded_decimal(
             fields["itm_points"], f"{label}.itm_points", Decimal(0), Decimal(50))
+    if "otm_points" in fields:
+        parsed["otm_points"] = _bounded_decimal(
+            fields["otm_points"], f"{label}.otm_points", Decimal(0), Decimal(50))
     if "max_premium" in fields:
         raw_premium = fields["max_premium"]
         if raw_premium is None or (isinstance(raw_premium, str) and raw_premium.strip() == ""):
@@ -246,6 +266,11 @@ def _parse_override_fields(name: str, fields: Any, source: str) -> dict[str, Any
         if not isinstance(flag, bool):
             raise ValueError(f"{label}.flow_rules must be true or false")
         parsed["flow_rules"] = flag
+    if "take_profit" in fields:
+        flag = fields["take_profit"]
+        if not isinstance(flag, bool):
+            raise ValueError(f"{label}.take_profit must be true or false")
+        parsed["take_profit"] = flag
     return parsed
 
 
@@ -312,6 +337,8 @@ class Settings:
     max_premium: Optional[Decimal] = Decimal("5.00")  # OPEN limit only; None means no cap. Exits are never capped.
     order_qty: Optional[int] = None  # when set, an open uses this size instead of the alert qty
     flow_rules: bool = False  # FlowVWAP session, regime, and underlying exits
+    otm_points: Decimal = Decimal(0)  # how far OTM a strike may be; 0 keeps the ATM-through-ITM window
+    take_profit: bool = True  # false skips the premium take-profit, including on a multi-lot open
     max_orders_per_day: int = 3
     max_daily_opens: Decimal = Decimal("1500")  # $ spent on OPEN orders per ET day
     allowlist: set[str] = field(default_factory=set)
@@ -342,12 +369,14 @@ class Settings:
             "delta_band_min": format(self.delta_band_min, "f"),
             "delta_band_max": format(self.delta_band_max, "f"),
             "itm_points": format(self.itm_points, "f"),
+            "otm_points": format(self.otm_points, "f"),
             "max_premium": None if self.max_premium is None else format(self.max_premium, "f"),
             "max_qty": self.max_qty,
             "order_qty": self.order_qty,
             "flow_rules": self.flow_rules,
             "tp_percent": format(self.tp_percent, "f"),
             "tp_single": self.tp_single,
+            "take_profit": self.take_profit,
             "stop_loss_percent": None if self.stop_loss_percent is None else format(self.stop_loss_percent, "f"),
         }
 
@@ -1016,9 +1045,14 @@ def itm_amount(strike: Decimal, spot: Decimal, right: Literal["C", "P"]) -> Deci
 
 
 def in_window(strike: Decimal, spot: Decimal, right: Literal["C", "P"],
-              itm_points: Decimal = ITM_POINTS) -> bool:
+              itm_points: Decimal = ITM_POINTS, otm_points: Decimal = Decimal(0)) -> bool:
+    """True when the strike is between `otm_points` out of the money and `itm_points` in the money.
+
+    `otm_points` of 0 is the ATM-through-ITM window the existing profiles use. A positive value
+    reaches strikes that are out of the money in the trade's direction. ATM stays included.
+    """
     amount = itm_amount(strike, spot, right)
-    return Decimal(0) <= amount <= itm_points
+    return -otm_points <= amount <= itm_points
 
 
 def band_distance(absolute_delta: Decimal, lo: Decimal = DELTA_LO, hi: Decimal = DELTA_HI) -> Decimal:
@@ -1179,6 +1213,9 @@ def price_text(value: Decimal) -> str:
     if text.endswith("0"):
         text = text[:-1]
     return text
+
+
+TAKE_PROFIT_OFF = "take-profit is off for this strategy"
 
 
 def no_take_profit_reason(qty: int, fraction: Decimal) -> str:
@@ -1565,13 +1602,18 @@ async def build_open(payload: dict, underlying: str, strategy: str, client: "Pub
     expiry = as_et(now).date() + timedelta(days=s.expiry_days)
     chain = await client.option_chain(underlying, expiry.isoformat())
     window = [leg for leg in legs_from_chain(chain, underlying, expiry, right)
-              if in_window(leg.strike, spot, right, s.itm_points)]
+              if in_window(leg.strike, spot, right, s.itm_points, s.otm_points)]
     window.sort(key=lambda leg: (leg.strike, leg.symbol))
     if not window:
         noun = "call" if right == "C" else "put"
         points = format(s.itm_points, "f")
+        spot_text = dec_text(spot)
+        if s.otm_points > 0:
+            raise Reject(
+                f"no {underlying} {noun} strikes from {format(s.otm_points, 'f')} points OTM "
+                f"to {points} points ITM around ATM {spot_text} for {expiry.isoformat()}")
         raise Reject(
-            f"no {underlying} {noun} strikes from ATM {dec_text(spot)} to {points} points ITM for {expiry.isoformat()}")
+            f"no {underlying} {noun} strikes from ATM {spot_text} to {points} points ITM for {expiry.isoformat()}")
     greeks = await fetch_greeks_map(client, [leg.symbol for leg in window])
     window = [with_greeks(leg, greeks) for leg in window]
     chosen = choose_leg(window, spot, s.delta_band_min, s.delta_band_max)
@@ -1907,6 +1949,11 @@ async def plan_take_profit(order: dict, s: "Settings", client: "PublicClient", s
     if s.flow_rules:
         report = {"attached": False, "quantity": 0, "qty_open": qty, "runners": qty,
                   "status": "NONE", "reason": flowvwap.UNDERLYING_EXIT}
+        jlog("take_profit", **report)
+        return report, None
+    if not s.take_profit:
+        report = {"attached": False, "quantity": 0, "qty_open": qty, "runners": qty,
+                  "status": "NONE", "reason": TAKE_PROFIT_OFF}
         jlog("take_profit", **report)
         return report, None
     entry = order["limit_price"] if isinstance(order["limit_price"], Decimal) else Decimal(str(order["limit_price"]))
@@ -2447,6 +2494,8 @@ async def submit_paper_exits(alpaca: AlpacaClient, store: Store, s: Settings, da
     if row.get("tp_order_id"):
         take_profit = _exit_report(True, _count_field(row, "tp_qty"), status=str(row.get("tp_status") or "RESTING"),
                                    limit_price=row.get("tp_limit"), orderId=row.get("tp_order_id"))
+    elif not s.take_profit:
+        take_profit = _exit_report(False, 0, status="NONE", qty_open=qty, runners=qty, reason=TAKE_PROFIT_OFF)
     elif tp_qty < 1:
         take_profit = _exit_report(False, 0, status="NONE", reason=no_take_profit_reason(qty, s.tp_fraction))
     else:
@@ -2504,7 +2553,7 @@ def apply_exit_reports(row: dict, take_profit: dict, stop: dict) -> None:
         row["stop_qty"] = 0
     tp_off = {
         "single contract closes on the flatten alert; set TP_SINGLE to take profit that contract",
-        "TP_FRACTION is 0", "no take-profit quantity", flowvwap.UNDERLYING_EXIT,
+        "TP_FRACTION is 0", "no take-profit quantity", flowvwap.UNDERLYING_EXIT, TAKE_PROFIT_OFF,
     }
     stop_off = {"STOP_LOSS_PERCENT is not set", flowvwap.UNDERLYING_EXIT}
     row["exits_placed"] = bool(
@@ -2660,7 +2709,10 @@ async def run_paper_alert(payload: dict, alert_id: str, day: str, now: datetime,
                 take_profit, stop = await submit_paper_exits(
                     alpaca, store, s, day, provisional, price, penny)
             else:
-                take_profit = _exit_report(False, 0, status="NONE", reason="waiting for the entry to fill")
+                if s.take_profit:
+                    take_profit = _exit_report(False, 0, status="NONE", reason="waiting for the entry to fill")
+                else:
+                    take_profit = _exit_report(False, 0, status="NONE", reason=TAKE_PROFIT_OFF)
                 if s.stop_loss_percent is None:
                     stop = _exit_report(False, 0, status="NONE", reason="STOP_LOSS_PERCENT is not set")
                 else:
