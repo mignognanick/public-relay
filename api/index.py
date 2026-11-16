@@ -14,8 +14,9 @@ Positions are one row per underlying + strategy + mode, so a QQQ flatten cannot 
 Per-strategy selection and exit overrides live in BUILTIN_STRATEGY_OVERRIDES; STRATEGY_OVERRIDES
 (JSON) replaces individual keys. FlowVWAP uses underlying exits and a 09:30-11:30 window.
 QQQ_EMA_VWAP keeps its premium take-profit profile. PremarketES buys a slightly OTM SPY
-contract and flattens only when its own close alert arrives. Daily order and spend caps stay shared
-on the paper and preflight books. The live book has its own caps.
+contract and flattens only when its own close alert arrives. PremarketES_MU does the same
+for MU, with a wider OTM window aimed at delta 0.125-0.15. Daily order and spend caps stay shared
+on the paper and preflight books. The live book has its own caps and is only PremarketES.
 Selection stays on Public.com. PAPER then checks the OCC symbol at Alpaca and places the entry,
 take-profit, and optional stop there. A live PremarketES entry is a DAY limit after preflight.
 """
@@ -56,6 +57,8 @@ MARKET_OPEN = dtime(9, 31)
 MARKET_CLOSE = dtime(15, 55)
 # Alpaca rejects new 0DTE entries before the cash close. SPY and QQQ have a later cutoff.
 # QQQ is always accepted so QQQ_EMA_VWAP needs no ALLOWLIST edit. SPY stays on ALLOWLIST.
+# MU is added on the PremarketES_MU profile only, in for_strategy, so other strategies
+# still need it on ALLOWLIST.
 BUILTIN_UNDERLYINGS = frozenset({"QQQ"})
 PAPER_HOST = "paper-api.alpaca.markets"
 PAPER_BASE_URL = "https://paper-api.alpaca.markets"
@@ -188,6 +191,24 @@ BUILTIN_STRATEGY_OVERRIDE_RAW: dict[str, dict[str, Any]] = {
         "take_profit": False,
         "flow_rules": False,
     },
+    # MU 0DTE (the alert fires on Mon/Wed/Fri, when MU lists an expiry). Absolute delta
+    # 0.125-0.15, from ATM through 70 points OTM. Listed near-money MU strikes are $5
+    # apart ($2.50 below about $750); $10 strikes are only far from the money. Seven $5
+    # strikes is 35 points, and that stops around a 0.30 delta. On the 2026-11-16 chain
+    # the 0.15 call was about $59-64 OTM, so 70 points is what reaches the band. No
+    # per-profile premium cap: opens use the global MAX_PREMIUM. No take-profit, no
+    # option stop, and none of the FlowVWAP session rules.
+    "PremarketES_MU": {
+        "delta_band_min": "0.125",
+        "delta_band_max": "0.15",
+        "itm_points": "0",
+        "otm_points": "70",
+        "max_qty": 5,
+        "order_qty": 5,
+        "stop_loss_percent": None,
+        "take_profit": False,
+        "flow_rules": False,
+    },
 }
 
 
@@ -241,7 +262,7 @@ def _parse_override_fields(name: str, fields: Any, source: str) -> dict[str, Any
             fields["itm_points"], f"{label}.itm_points", Decimal(0), Decimal(50))
     if "otm_points" in fields:
         parsed["otm_points"] = _bounded_decimal(
-            fields["otm_points"], f"{label}.otm_points", Decimal(0), Decimal(50))
+            fields["otm_points"], f"{label}.otm_points", Decimal(0), Decimal(80))
     if "max_premium" in fields:
         raw_premium = fields["max_premium"]
         if raw_premium is None or (isinstance(raw_premium, str) and raw_premium.strip() == ""):
@@ -442,12 +463,18 @@ class Settings:
 
         Unknown strategy names return this object unchanged. Caps, expiry, and mode are not copied
         from a profile, so every strategy shares MAX_ORDERS_PER_DAY and MAX_DAILY_OPENS.
+        PremarketES_MU also accepts MU, without adding it to the global allowlist.
         """
         merged = dict(BUILTIN_STRATEGY_OVERRIDES.get(name, {}))
         merged.update(self.strategy_overrides.get(name, {}))
         if not merged:
             return self
-        return replace(self, **merged)
+        profile = replace(self, **merged)
+        # PremarketES_MU trades MU without an ALLOWLIST edit. Other strategies do not
+        # gain MU from this. The set is copied so the global allowlist stays as configured.
+        if name == "PremarketES_MU":
+            profile = replace(profile, allowlist=set(profile.allowlist) | {"MU"})
+        return profile
 
     def strategy_public_view(self) -> dict[str, dict[str, Any]]:
         names = set(BUILTIN_STRATEGY_OVERRIDES) | set(self.strategy_overrides)
@@ -1638,6 +1665,18 @@ def leg_from_row(row: Any, underlying: str, expiry: date, right: Literal["C", "P
                positive_price(row.get("bid")), positive_price(row.get("ask")))
 
 
+def listed_expiry(row: Any) -> Optional[date]:
+    """Expiry encoded on a chain row's OCC symbol. Rows without one do not name a date."""
+    if not isinstance(row, dict):
+        return None
+    instrument = row.get("instrument") if isinstance(row.get("instrument"), dict) else {}
+    raw_symbol = str(instrument.get("symbol") or "").upper().replace(" ", "")
+    parsed = parse_occ(raw_symbol)
+    if parsed is None:
+        return None
+    return parsed["expiry"]
+
+
 def legs_from_chain(chain: dict, underlying: str, expiry: date, right: Literal["C", "P"]) -> list[Leg]:
     base = str(chain.get("baseSymbol") or "").upper()
     if base and base != underlying:
@@ -1646,6 +1685,15 @@ def legs_from_chain(chain: dict, underlying: str, expiry: date, right: Literal["
     rows = chain.get(key)
     if not isinstance(rows, list):
         raise Reject(f"option chain missing {key}", 502)
+    # A chain that only lists a later expiry is not this date. Reject it, including any
+    # strike-only rows, so those strikes are not relabeled as the requested expiry.
+    listed = [item for row in rows if (item := listed_expiry(row)) is not None]
+    if listed and all(item != expiry for item in listed):
+        noun = "call" if right == "C" else "put"
+        jlog("expiry_unavailable", underlying=underlying, expiry=expiry.isoformat(), right=right,
+             note="no contracts for this expiry; not using a later date")
+        raise Reject(
+            f"no {underlying} {noun} expiry on {expiry.isoformat()}; not using a later date")
     legs = []
     for row in rows:
         leg = leg_from_row(row, underlying, expiry, right)
@@ -1714,7 +1762,12 @@ async def build_open(payload: dict, underlying: str, strategy: str, client: "Pub
         gate = await flow_entry_gate(store, client, market_data, underlying, side, spot, now, s.enforce_hours)
     expiry = as_et(now).date() + timedelta(days=s.expiry_days)
     chain = await client.option_chain(underlying, expiry.isoformat())
-    window = [leg for leg in legs_from_chain(chain, underlying, expiry, right)
+    legs = legs_from_chain(chain, underlying, expiry, right)
+    if not legs:
+        # Nothing listed for the requested expiry. A later date is not tried.
+        jlog("expiry_unavailable", underlying=underlying, expiry=expiry.isoformat(), right=right,
+             note="no contracts for this expiry; not using a later date")
+    window = [leg for leg in legs
               if in_window(leg.strike, spot, right, s.itm_points, s.otm_points)]
     window.sort(key=lambda leg: (leg.strike, leg.symbol))
     if not window:

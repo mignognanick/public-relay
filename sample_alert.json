@@ -1,5 +1,5 @@
 {
-  "_comment": "Paste ONE object below (without this wrapper) into the TradingView alert Message box. underlying_template is FlowVWAP. qqq_underlying_template is QQQ_EMA_VWAP (delta 0.60-0.75, max premium 5.00 on opens, 50% take-profit, no stop, max qty 1). premarketes_template is PremarketES (SPY, delta 0.35-0.40, ATM through 5 points OTM, qty 5, no take-profit, no option stop). The relay ignores qty for FlowVWAP and PremarketES. STOP_LOSS_PERCENT and MODE are environment settings, not alert fields. template/fixed_example still send a full OCC symbol.",
+  "_comment": "Paste ONE object below (without this wrapper) into the TradingView alert Message box. underlying_template is FlowVWAP. qqq_underlying_template is QQQ_EMA_VWAP (delta 0.60-0.75, max premium 5.00 on opens, 50% take-profit, no stop, max qty 1). premarketes_template is PremarketES (SPY, delta 0.35-0.40, ATM through 5 points OTM, qty 5, no take-profit, no option stop). premarketes_mu_template is PremarketES_MU (MU, delta 0.125-0.15, ATM through 70 points OTM, qty 5, no take-profit, no option stop). The relay ignores qty for FlowVWAP, PremarketES, and PremarketES_MU, and ignores unknown keys such as pm_log. STOP_LOSS_PERCENT and MODE are environment settings, not alert fields. template/fixed_example still send a full OCC symbol.",
   "underlying_template": {
     "passphrase": "REPLACE_WITH_WEBHOOK_PASSPHRASE",
     "symbol": "{{ticker}}",
@@ -20,6 +20,17 @@
     "market_position": "{{strategy.market_position}}",
     "prev_market_position": "{{strategy.prev_market_position}}",
     "strategy": "PremarketES",
+    "alert_id": "{{ticker}}-{{strategy.order.id}}-{{timenow}}"
+  },
+  "premarketes_mu_template": {
+    "passphrase": "REPLACE_WITH_WEBHOOK_PASSPHRASE",
+    "symbol": "{{ticker}}",
+    "side": "{{strategy.order.action}}",
+    "qty": "{{strategy.order.contracts}}",
+    "underlying_price": "{{close}}",
+    "market_position": "{{strategy.market_position}}",
+    "prev_market_position": "{{strategy.prev_market_position}}",
+    "strategy": "PremarketES_MU",
     "alert_id": "{{ticker}}-{{strategy.order.id}}-{{timenow}}"
   },
   "qqq_underlying_template": {

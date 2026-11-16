@@ -24,6 +24,7 @@ from test_index import (  # noqa: E402
 from test_premarketes import (  # noqa: E402
     ES_CALL, ES_CALLS, ES_PUTS, es_alert,
 )
+from test_premarketes_mu import mu_alert, mu_public  # noqa: E402
 
 CASH_ACCOUNT = "CASH1"
 
@@ -122,6 +123,7 @@ def test_live_switches_and_the_allowlist_cannot_widen():
 
     widened = relay.Settings.from_env({"LIVE_STRATEGIES": "PremarketES, FlowVWAP, QQQ_EMA_VWAP"})
     assert widened.live_strategies == frozenset({"PremarketES"})
+    assert "PremarketES_MU" not in widened.live_strategies
     assert relay.Settings.from_env({"LIVE_STRATEGIES": "FlowVWAP"}).live_strategies == frozenset()
     assert relay.Settings.from_env({"LIVE_STRATEGIES": "PremarketES"}).live_strategies == frozenset({"PremarketES"})
     with pytest.raises(ValueError):
@@ -387,6 +389,16 @@ def test_other_strategies_stay_on_paper_while_premarketes_is_live(tmp_path):
     assert client.sb.positions[("SPY", "PremarketES", "LIVE")]["qty"] == 1
     assert client.sb.counters[("2026-10-19", "PAPER")][0] == 1
     assert client.sb.counters[("2026-10-19", "LIVE")][0] == 1
+
+    broker_mu = FakeAlpaca()
+    mu_client, mu_fake = live_make(tmp_path / "mu", public=mu_public(), alpaca=broker_mu)
+    mu = mu_client.post("/webhook", json=mu_alert(alert_id="mu-paper"))
+    assert mu.status_code == 200, mu.text
+    assert mu.json()["broker"] == "alpaca" and mu.json()["mode"] == "PAPER"
+    assert mu.json()["order"]["qty"] == "5"
+    assert orders(mu_fake) == []
+    assert mu_client.sb.positions[("MU", "PremarketES_MU", "PAPER")]["qty"] == 5
+    assert ("MU", "PremarketES_MU", "LIVE") not in mu_client.sb.positions
 
     removed, removed_fake = live_make(
         tmp_path / "removed", public=live_public(), alpaca=FakeAlpaca(),
