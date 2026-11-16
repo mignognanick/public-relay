@@ -46,6 +46,10 @@ are unchanged: LIVE still requires both `MODE=LIVE` and `LIVE_CONFIRM=I_UNDERSTA
 | `WEBHOOK_PASSPHRASE` | empty | Shared secret in the TradingView alert. Required. |
 | `MODE` | `PREFLIGHT` | `PREFLIGHT` never places an order. `LIVE` is ignored unless `LIVE_CONFIRM` matches. `PAPER` places on Alpaca paper and does not read `LIVE_CONFIRM`. |
 | `LIVE_CONFIRM` | empty | Must be exactly `I_UNDERSTAND` together with `MODE=LIVE`. |
+| `LIVE_STRATEGIES` | `PremarketES` | Optional. Intersected with the checked-in ceiling, which is only `PremarketES`. Other names are ignored. |
+| `LIVE_MAX_PREMIUM` | `2.50` | Live open limit per contract. Refuses to start above `2.50`. |
+| `LIVE_MAX_ORDERS_PER_DAY` | `1` | Live entry orders per ET day. Refuses to start above `1`. |
+| `LIVE_MAX_DAILY_OPENS` | `250` | Dollars of live open premium per ET day. Refuses to start above `250`. |
 | `PUBLIC_ACCOUNT_ID` | empty | Account to trade. Blank picks the first account that reports an options level. |
 | `ALLOWLIST` | empty | Comma-separated underlyings. Empty allows nothing else. `QQQ` is always added, so this does not need an edit for the new strategy. `SPY` stays on this list (production already has it; do not remove it). |
 | `MAX_QTY` | `1` | Max contracts on one order (1–100). Partial take-profit needs this at least 2, unless `TP_SINGLE` is on. Overridable per strategy. |
@@ -70,7 +74,7 @@ are unchanged: LIVE still requires both `MODE=LIVE` and `LIVE_CONFIRM=I_UNDERSTA
 | `SUPABASE_SERVICE_KEY` | empty | Service-role key. Server only. |
 | `CRON_SECRET` | empty | Bearer token for `GET /keepalive`. |
 
-`/health` returns every tunable above except the secrets. `settings.strategies` is the effective per-strategy block (built-in profiles plus `STRATEGY_OVERRIDES`). A strategy that is not listed there uses the global `settings` values. `FlowVWAP`, `QQQ_EMA_VWAP`, and `PremarketES` are listed. `settings.daily_caps` is `shared`.
+`/health` returns every tunable above except the secrets. `settings.strategies` is the effective per-strategy block (built-in profiles plus `STRATEGY_OVERRIDES`). A strategy that is not listed there uses the global `settings` values. `FlowVWAP`, `QQQ_EMA_VWAP`, and `PremarketES` are listed. `settings.daily_caps` is `shared` for the paper and preflight books. `settings.live_strategies` and the `live_max_*` fields are the live ceiling. `live_account_configured` is true when `PUBLIC_ACCOUNT_ID` is set. The account id itself is not returned.
 
 ## Per-strategy settings
 
@@ -103,7 +107,40 @@ Quantity is 5 (`order_qty`). The alert's `qty` and the global `MAX_QTY` are not 
 
 The Pine script owns the $0.50 SPY stop and the 10:00 ET flatten. It sends a close alert (market position flat). The relay sells every contract still open for that `(underlying, strategy, mode)` row, the same way it flattens FlowVWAP and QQQ. A PremarketES close does not sell a FlowVWAP position, and the FlowVWAP monitor does not sell a PremarketES position.
 
-No env edit and no migration. `SPY` is already on the allowlist. `MODE` stays wherever it already is. This profile places on Alpaca only when that mode is already `PAPER`.
+No env edit and no migration for the paper profile. `SPY` is already on the allowlist. `MODE` stays wherever it already is. This profile places on Alpaca when the effective mode is `PAPER`, including when the process is `LIVE` and `PremarketES` has been removed from the live set. The live book is a different path. See below.
+
+## Live PremarketES on Public.com
+
+Paper quantity stays 5. A live entry is 1 contract. The live set is the checked-in ceiling `LIVE_STRATEGY_CEILING = {PremarketES}`. `LIVE_STRATEGIES` is optional. A blank value uses that ceiling. A name that is not `PremarketES` is ignored, so the set cannot grow from an env edit. If none of the names are `PremarketES`, nothing is live and PremarketES stays on Alpaca paper.
+
+Both switches are still required. `MODE=LIVE` without `LIVE_CONFIRM=I_UNDERSTAND` stays `PREFLIGHT` and places nothing. `MODE=PAPER` ignores `LIVE_CONFIRM`.
+
+Live caps, separate from the shared paper caps. An env value above the ceiling refuses to start. A lower value is kept.
+
+| Cap | Default | Ceiling | Why |
+| --- | --- | --- | --- |
+| Contracts | `1` | `1` | Options level 2, long only. One contract is the whole live order. |
+| Entries per ET day | `1` | `1` | A cash account cannot reuse the premium until it settles. |
+| Premium per contract | `$2.50` | `$2.50` | Slightly OTM 0DTE SPY is often under this. Above it, the entry is rejected. |
+| Open premium per ET day | `$250` | `$250` | `1 × 2.50 × 100`. Leaves most of a ~$500 deposit untouched. |
+
+The entry limit is the bid/ask mid, or the ask when the mid is missing, and it has to be at or under the live premium cap. The order is a DAY limit buy-to-open. There is no market order. Public.com `preflight/single-leg` runs first. Settled cash is `buyingPower.cashOnlyBuyingPower` from `GET /userapigateway/trading/{accountId}/portfolio/v2`, and `optionsBuyingPower` when that field is present (the lower of the two). Margin buying power is not used. If settled cash is below the premium, or the preflight `buyingPowerRequirement` is above settled cash, the entry is rejected and the daily slot is released.
+
+The exit is the TradingView flat or sell alert. It sell-to-closes the stored live contract at the bid (a marketable limit), for the quantity still open, and never more than the opened quantity. A raw OCC symbol cannot open or close a live PremarketES position. The position row is `(SPY, PremarketES, LIVE)`. A paper row for the same strategy is left alone. `alert_id` is reserved before the order, and the Public.com `orderId` is a UUID derived from that id, so a retried webhook does not buy twice.
+
+`/health` `settings` includes `live_strategies`, `live_qty`, `live_max_orders_per_day`, `live_max_premium`, `live_max_daily_opens`, and `live_account_configured`. It does not include the account id or any secret. The strategy block still shows the paper profile (quantity 5).
+
+Set these yourself, in this order. This repo does not set them.
+
+1. `PUBLIC_SECRET` is already required for contract selection.
+2. `PUBLIC_ACCOUNT_ID` — the cash brokerage account. A live entry is rejected while this is blank. The relay will not pick an account for you.
+3. `ALPACA_KEY_ID`, `ALPACA_SECRET_KEY`, and the paper `ALPACA_BASE_URL`, so FlowVWAP, QQQ_EMA_VWAP, and every other strategy keep paper-trading. If those keys are missing, a non-allowlisted alert fails closed. It is not sent to Public.com.
+4. `MODE=LIVE`
+5. `LIVE_CONFIRM=I_UNDERSTAND`
+
+Leave `LIVE_STRATEGIES`, `LIVE_MAX_PREMIUM`, `LIVE_MAX_ORDERS_PER_DAY`, and `LIVE_MAX_DAILY_OPENS` unset unless you are tightening a cap. Do not expect a higher number to work.
+
+Cash settlement: selling the contract today does not put that premium back into settled cash until the next session. The one-entry cap matches that. A DAY limit that never fills still uses the day's entry slot once Public.com accepts it. A rejected preflight or a rejected cash check does not. Public.com is options level 2 here, so the account cannot sell to open. The exit path does not send a buy. Unfilled protective orders are still not submitted; the close alert is the exit.
 
 The FlowVWAP monitor sells the whole position and does not consume `MAX_ORDERS_PER_DAY` or `MAX_EXIT_ORDERS_PER_DAY`, so a full exit cap cannot block the 11:30 flatten.
 
@@ -218,7 +255,7 @@ What PAPER does:
 - `GET /health` reports `mode`, `alpaca_configured`, and `GET /v2/account` status. Equity is included when Alpaca sends it. Cash and buying power are not.
 - Secrets are not logged. An OCC open is placed but not stored; the position lifecycle above is the underlying alert (the FlowVWAP template).
 
-`LIVE` is unchanged: it still places only the entry, or a flatten sell, and only when `MODE=LIVE` and `LIVE_CONFIRM=I_UNDERSTAND`. The take-profit and the stop stay reported.
+`LIVE` places a Public.com order only for a strategy on the live ceiling, and only when `MODE=LIVE` and `LIVE_CONFIRM=I_UNDERSTAND`. The ceiling is `PremarketES`. Every other strategy in that same process keeps the Alpaca paper path above. The take-profit and the stop stay unsent on the Public.com order. PremarketES does not use them.
 
 ## TradingView alert message
 
