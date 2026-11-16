@@ -9,6 +9,7 @@ A full OCC symbol is forwarded as sent. An underlying such as SPY selects a call
 Positions are one row per underlying + strategy + mode, so a QQQ flatten cannot close SPY.
 Per-strategy selection and exit overrides live in BUILTIN_STRATEGY_OVERRIDES; STRATEGY_OVERRIDES
 (JSON) replaces individual keys. FlowVWAP uses underlying exits and a 09:30-11:30 window.
+On PAPER, FlowVWAP can rest a buy limit under the option mid; the other profiles do not.
 QQQ_EMA_VWAP keeps its premium take-profit profile. PremarketES buys a slightly OTM SPY
 contract and flattens only when its own close alert arrives. PremarketES_MU does the same
 for MU, with a wider OTM window aimed at delta 0.125-0.15. Daily order and spend caps stay shared.
@@ -38,6 +39,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from api import flowvwap
+from api.notify import (
+    NotifyClient, format_et, parse_time, render_cancelled, render_exit, render_filled, render_placed,
+)
 
 ET = ZoneInfo("America/New_York")
 API_BASE = "https://api.public.com"
@@ -68,7 +72,9 @@ DELTA_HI = Decimal("0.60")
 LimitFallback = Literal["ask", "bid", "reject"]
 REDACT_KEYS = {"passphrase", "secret", "authorization", "accesstoken", "access_token",
                "public_secret", "webhook_passphrase", "apikey", "supabase_service_key",
-               "alpaca_key_id", "alpaca_secret_key", "apca-api-key-id", "apca-api-secret-key"}
+               "alpaca_key_id", "alpaca_secret_key", "apca-api-key-id", "apca-api-secret-key",
+               "resend_api_key", "notify_email_from", "notify_email_to", "cron_secret",
+               "relay_cron_secret"}
 
 
 # --------------------------------------------------------------------------- config
@@ -137,6 +143,9 @@ STRATEGY_OVERRIDE_KEYS = (
     "flow_rules",
     "otm_points",
     "take_profit",
+    "entry_limit_offset",
+    "entry_limit_timeout_sec",
+    "notify_email",
 )
 # Checked-in defaults. An absent strategy uses the global env. STRATEGY_OVERRIDES merges per key
 # on top of these. QQQ_EMA_VWAP is unchanged. FlowVWAP no longer inherits the global profile.
@@ -162,6 +171,13 @@ BUILTIN_STRATEGY_OVERRIDE_RAW: dict[str, dict[str, Any]] = {
         "order_qty": 5,
         "stop_loss_percent": None,
         "flow_rules": True,
+        # PAPER only. None or 0 is today's immediate buy at the mid. 0.40 rests a
+        # day limit that far under the mid. Email stays off until NOTIFY_EMAIL_ENABLED
+        # and the Resend variables are set; this flag only names FlowVWAP as the
+        # strategy that sends once they are.
+        "entry_limit_offset": "0.40",
+        "entry_limit_timeout_sec": 300,
+        "notify_email": True,
     },
     # SPY 0DTE. Absolute delta 0.35-0.40, from ATM through 5 points OTM (no ITM).
     # Five contracts. The Pine close alert flattens the position. No premium take-profit
@@ -292,7 +308,36 @@ def _parse_override_fields(name: str, fields: Any, source: str) -> dict[str, Any
         if not isinstance(flag, bool):
             raise ValueError(f"{label}.take_profit must be true or false")
         parsed["take_profit"] = flag
+    if "entry_limit_offset" in fields:
+        parsed["entry_limit_offset"] = _parse_limit_offset(
+            fields["entry_limit_offset"], f"{label}.entry_limit_offset")
+    if "entry_limit_timeout_sec" in fields:
+        parsed["entry_limit_timeout_sec"] = _parse_limit_timeout(
+            fields["entry_limit_timeout_sec"], f"{label}.entry_limit_timeout_sec")
+    if "notify_email" in fields:
+        flag = fields["notify_email"]
+        if not isinstance(flag, bool):
+            raise ValueError(f"{label}.notify_email must be true or false")
+        parsed["notify_email"] = flag
     return parsed
+
+
+def _parse_limit_offset(value: Any, label: str) -> Optional[Decimal]:
+    """Null, blank, or 0 keeps the immediate mid entry. A positive number is dollars under the mid."""
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return None
+    number = _override_decimal(value, label)
+    if number < 0 or number > 50:
+        raise ValueError(f"{label} must be between 0 and 50, or null for an immediate entry")
+    if number == 0:
+        return None
+    return number
+
+
+def _parse_limit_timeout(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value > 7200:
+        raise ValueError(f"{label} must be an integer from 1 to 7200 seconds")
+    return value
 
 
 def _builtin_strategy_overrides() -> dict[str, dict[str, Any]]:
@@ -381,6 +426,13 @@ class Settings:
     alpaca_key_id: str = ""
     alpaca_secret_key: str = ""
     alpaca_base_url: str = ""
+    entry_limit_offset: Optional[Decimal] = None  # dollars under the mid; None or 0 is an immediate entry
+    entry_limit_timeout_sec: int = 300
+    notify_email: bool = False
+    notify_email_enabled: bool = False
+    resend_api_key: str = ""
+    notify_email_from: str = ""
+    notify_email_to: str = ""
     # Env layer only. Built-in profiles are applied in for_strategy and are not stored here.
     strategy_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -399,6 +451,9 @@ class Settings:
             "tp_single": self.tp_single,
             "take_profit": self.take_profit,
             "stop_loss_percent": None if self.stop_loss_percent is None else format(self.stop_loss_percent, "f"),
+            "entry_limit_offset": None if self.entry_limit_offset is None else format(self.entry_limit_offset, "f"),
+            "entry_limit_timeout_sec": self.entry_limit_timeout_sec,
+            "notify_email": self.notify_email,
         }
 
     def for_strategy(self, name: str) -> "Settings":
@@ -444,6 +499,9 @@ class Settings:
             "max_exit_orders_per_day": self.max_exit_orders_per_day,
             "enforce_hours": self.enforce_hours,
             "alpaca_configured": bool(self.alpaca_key_id and self.alpaca_secret_key),
+            "notify_email_enabled": self.notify_email_enabled,
+            "notify_email_configured": bool(
+                self.resend_api_key and self.notify_email_from and self.notify_email_to),
             "strategies": self.strategy_public_view(),
             "daily_caps": "shared",
         }
@@ -516,6 +574,10 @@ class Settings:
             alpaca_key_id=alpaca_key_id,
             alpaca_secret_key=alpaca_secret_key,
             alpaca_base_url=alpaca_base_url,
+            notify_email_enabled=_env_bool(e, "NOTIFY_EMAIL_ENABLED", False),
+            resend_api_key=_env_text(e, "RESEND_API_KEY"),
+            notify_email_from=_env_text(e, "NOTIFY_EMAIL_FROM"),
+            notify_email_to=_env_text(e, "NOTIFY_EMAIL_TO"),
             strategy_overrides=_parse_strategy_overrides(_env_text(e, "STRATEGY_OVERRIDES")),
         )
         settings._validate_strategy_profiles()
@@ -616,9 +678,10 @@ class Store:
                           stop_limit: Optional[str] = None, stop_order_id: Optional[str] = None,
                           stop_status: str = "NONE", entry_order_id: Optional[str] = None,
                           entry_status: str = "NONE", entry_filled: int = 0,
-                          exits_placed: bool = False, entry_underlying: Optional[str] = None,
+                          exits_placed: bool = False,                           entry_underlying: Optional[str] = None,
                           stop_underlying: Optional[str] = None, target_underlying: Optional[str] = None,
-                          regime: Optional[str] = None) -> Optional[str]:
+                          regime: Optional[str] = None, entry_placed_at: Optional[str] = None,
+                          alert_underlying: Optional[str] = None) -> Optional[str]:
         args: dict[str, Any] = {
             "p_underlying": underlying, "p_strategy": strategy, "p_mode": mode, "p_symbol": symbol,
             "p_entry_side": entry_side, "p_right_side": right_side, "p_qty": qty, "p_strike": strike,
@@ -637,6 +700,10 @@ class Store:
         }
         if any(value not in (None, "") for value in levels.values()):
             args.update(levels)
+        # Sent only for a resting FlowVWAP limit, so a database still on 0006 can record everyone else.
+        if entry_placed_at not in (None, "") or alert_underlying not in (None, ""):
+            args["p_entry_placed_at"] = entry_placed_at
+            args["p_alert_underlying"] = alert_underlying
         data = await self._rpc("relay_record_open", args)
         return _rpc_reason(data, "relay_record_open")
 
@@ -667,7 +734,7 @@ class Store:
         return []
 
     async def save_paper(self, row: dict) -> Optional[str]:
-        data = await self._rpc("relay_save_paper", {
+        args: dict[str, Any] = {
             "p_underlying": row["underlying"], "p_strategy": row["strategy"], "p_mode": row["mode"],
             "p_entry_order_id": row.get("entry_order_id"), "p_entry_status": row.get("entry_status"),
             "p_entry_filled": row.get("entry_filled") or 0,
@@ -679,8 +746,26 @@ class Store:
             "p_stop_status": row.get("stop_status") or "NONE",
             "p_exits_placed": bool(row.get("exits_placed")),
             "p_qty_open": row.get("qty_open") if row.get("qty_open") is not None else row.get("qty"),
-        })
+        }
+        # QQQ saves omit these, so a database still on 0005 keeps working. A FlowVWAP
+        # limit row writes the anchor and the placed-at clock.
+        if row.get("entry_placed_at") not in (None, "") or row.get("alert_underlying") not in (None, ""):
+            args.update({
+                "p_write_levels": True,
+                "p_entry_underlying": row.get("entry_underlying"),
+                "p_stop_underlying": row.get("stop_underlying"),
+                "p_target_underlying": row.get("target_underlying"),
+                "p_entry_placed_at": row.get("entry_placed_at"),
+                "p_alert_underlying": row.get("alert_underlying"),
+            })
+        data = await self._rpc("relay_save_paper", args)
         return _rpc_reason(data, "relay_save_paper")
+
+    async def claim_notification(self, event_key: str) -> bool:
+        return bool(await self._rpc("relay_claim_notification", {"p_event_key": event_key}))
+
+    async def release_notification(self, event_key: str) -> None:
+        await self._rpc("relay_release_notification", {"p_event_key": event_key})
 
     async def record_close(self, underlying: str, strategy: str, mode: str, symbol: str,
                            alert_id: str, tp_status: Optional[str] = None, stop_status: Optional[str] = None,
@@ -1217,6 +1302,43 @@ def round_option_price(price: Decimal, penny: bool = False) -> Decimal:
     if rounded <= 0:
         raise Reject("option price must be > 0")
     return rounded
+
+
+def floor_option_price(price: Decimal, penny: bool = False) -> Decimal:
+    """Round a buy limit DOWN to a valid option tick, and never below one tick.
+
+    The tick is option_tick: $0.01 under $3, and $0.01 at every price when Alpaca
+    marks the contract ppind (the penny program). Otherwise $0.05 at and above $3.
+    SPY is not special-cased. Most SPY options are in the penny pilot, and ppind
+    is what says so. A contract Alpaca marks ppind false still uses nickels at
+    and above $3. A positive price smaller than one tick is raised to that tick.
+    """
+    if not price.is_finite() or price <= 0:
+        raise Reject("option price must be > 0")
+    tick = option_tick(price, penny)
+    units = (price / tick).to_integral_value(rounding=ROUND_DOWN)
+    rounded = (units * tick).quantize(tick)
+    if rounded <= 0:
+        return tick
+    return rounded
+
+
+def flow_entry_limit(mid: Decimal, offset: Decimal, penny: bool = False) -> Optional[Decimal]:
+    """Buy limit at mid minus offset, floored to the tick. None when that price is <= 0."""
+    raw = mid - offset
+    if raw <= 0:
+        return None
+    return floor_option_price(raw, penny)
+
+
+def flow_limit_offset(profile: "Settings", selection: Optional[dict]) -> Optional[Decimal]:
+    """Dollars under the mid for a FlowVWAP open. Other strategies, and a 0/None offset, stay immediate."""
+    if selection is None or selection.get("strategy") != "FlowVWAP" or selection.get("action") != "open":
+        return None
+    offset = profile.entry_limit_offset
+    if offset is None or offset <= 0:
+        return None
+    return offset
 
 
 def take_profit_limit(entry: Decimal, percent: Decimal, penny: bool = False) -> Decimal:
@@ -2679,17 +2801,224 @@ async def reconcile_paper_positions(store: "Store", alpaca: AlpacaClient, s: "Se
     return results
 
 
+def notify_secrets(settings: "Settings") -> tuple[str, ...]:
+    """Values that must never appear in an email body or a log line."""
+    raw = [
+        settings.public_secret, settings.webhook_passphrase, settings.supabase_key,
+        settings.alpaca_key_id, settings.alpaca_secret_key, settings.resend_api_key,
+        settings.notify_email_from, settings.notify_email_to,
+        os.environ.get("CRON_SECRET", ""), os.environ.get("RELAY_CRON_SECRET", ""),
+    ]
+    raw.extend(part.strip() for part in settings.notify_email_to.split(","))
+    return tuple(str(value).strip() for value in raw if str(value or "").strip())
+
+
+async def notify_event(notifier: Optional[NotifyClient], profile: "Settings", store: "Store",
+                       event_key: str, subject: str, body: str) -> None:
+    if notifier is None:
+        return
+    try:
+        await notifier.event(profile, store, event_key, subject, body)
+    except Exception as exc:
+        jlog("notify_failed", event_key=event_key, error=type(exc).__name__)
+
+
+def limit_expired(placed_at: Any, now: datetime, timeout_sec: int) -> bool:
+    if placed_at in (None, ""):
+        return False
+    text = str(placed_at).strip().replace("Z", "+00:00")
+    try:
+        placed = datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    if placed.tzinfo is None:
+        placed = placed.replace(tzinfo=ET)
+    return (as_et(now) - placed.astimezone(ET)).total_seconds() >= timeout_sec
+
+
+def exit_email_reason(signal: str) -> str:
+    """The monitor calls the 11:30 flatten `flatten`. The email says 11:30."""
+    if signal == "flatten":
+        return "11:30"
+    return signal
+
+
+async def notify_flow_placed(notifier: Optional[NotifyClient], profile: "Settings", store: "Store",
+                             row: dict, mid: str) -> None:
+    order_id = str(row.get("entry_order_id") or "")
+    if not order_id:
+        return
+    subject, body = render_placed("FlowVWAP", str(row.get("symbol") or ""), str(row.get("entry_limit") or ""), mid)
+    await notify_event(notifier, profile, store, f"placed:{order_id}", subject, body)
+
+
+async def notify_flow_filled(notifier: Optional[NotifyClient], profile: "Settings", store: "Store",
+                             row: dict, order: dict, now: datetime) -> None:
+    order_id = str(row.get("entry_order_id") or "")
+    if not order_id:
+        return
+    price = fill_price(order, Decimal(str(row.get("entry_limit") or "0")))
+    when = parse_time(order.get("filled_at"), now)
+    subject, body = render_filled(
+        "FlowVWAP", str(row.get("symbol") or ""), price_text(price), format_et(when))
+    await notify_event(notifier, profile, store, f"filled:{order_id}", subject, body)
+
+
+async def notify_flow_cancelled(notifier: Optional[NotifyClient], profile: "Settings", store: "Store",
+                                row: dict, reason: str) -> None:
+    order_id = str(row.get("entry_order_id") or "")
+    if not order_id:
+        return
+    subject, body = render_cancelled(
+        "FlowVWAP", str(row.get("symbol") or ""), reason, str(row.get("entry_limit") or ""),
+        _count_field(row, "entry_filled"))
+    await notify_event(notifier, profile, store, f"cancel:{order_id}:{reason}", subject, body)
+
+
+async def notify_flow_exit(notifier: Optional[NotifyClient], profile: "Settings", store: "Store",
+                           row: dict, reason: str, qty: int, exit_price: Decimal,
+                           order: Optional[dict]) -> None:
+    if qty < 1 or exit_price <= 0:
+        return
+    alert = str(row.get("opened_alert_id") or row.get("entry_order_id") or "")
+    if not alert:
+        return
+    fallback = Decimal(str(row.get("entry_limit") or "0"))
+    entry = fill_price(order or {}, fallback)
+    if entry <= 0:
+        entry = fallback
+    if entry <= 0:
+        return
+    subject, body = render_exit("FlowVWAP", str(row.get("symbol") or ""), reason, qty, entry, exit_price)
+    await notify_event(notifier, profile, store, f"exit:{alert}:{reason}", subject, body)
+
+
+async def anchor_flow_levels(store: "Store", client: "PublicClient", market_data: Optional["AlpacaData"],
+                             row: dict, now: datetime) -> Optional[dict]:
+    """Stop and target from SPY at the moment the fill is detected. None if the quote is missing.
+
+    The room check already ran against SPY at the alert, before the order was sent. A fill is
+    kept even when King has since moved closer than 0.50. The levels are still stored so the
+    monitor can exit.
+    """
+    try:
+        symbol = str(row.get("underlying") or "")
+        side = str(row.get("entry_side") or "")
+        if side not in ("BUY", "SELL"):
+            return None
+        spot = await underlying_mark(client, market_data, symbol, now)
+        if spot is None:
+            jlog("flowvwap_anchor_waiting", symbol=symbol)
+            return None
+        ctx = await load_flow_context(store, client, market_data, symbol, as_et(now).date())
+        typed_side: Literal["BUY", "SELL"] = "BUY" if side == "BUY" else "SELL"
+        king = ctx.get("king")
+        plan = flowvwap.exit_levels(spot, typed_side, king if isinstance(king, Decimal) else None)
+        if plan["skip"]:
+            jlog("flowvwap_fill_room", symbol=symbol, room=str(plan["room"]),
+                 note="filled limit keeps the position")
+        return {
+            "entry_underlying": dec_text(spot),
+            "stop_underlying": dec_text(plan["stop"]),
+            "target_underlying": dec_text(plan["target"]),
+        }
+    except (Reject, StoreError, httpx.HTTPError) as exc:
+        jlog("flowvwap_anchor_waiting", error=type(exc).__name__)
+        return None
+
+
+async def settle_flow_limit(row: dict, now: datetime, s: "Settings", store: "Store", client: "PublicClient",
+                            alpaca: AlpacaClient, market_data: Optional["AlpacaData"],
+                            notifier: Optional[NotifyClient]) -> dict:
+    """Refresh one resting FlowVWAP limit. A partial fill stays working until timeout, flat, or 11:30.
+
+    On timeout with nothing filled, the order is cancelled and the row is closed. The daily cap
+    stays consumed: it was counted when the limit was placed. On timeout with a partial fill,
+    the remainder is cancelled and the filled quantity is the position. Stops are anchored to
+    SPY at the first moment a fill is seen, not to SPY at the alert.
+    """
+    profile = s.for_strategy("FlowVWAP")
+    if not row.get("entry_placed_at"):
+        return row
+    refreshed = await refresh_paper_row(alpaca, row)
+    status = str(refreshed.get("entry_status") or "").upper()
+    filled = _count_field(refreshed, "entry_filled")
+    if filled > 0 and parse_decimal(refreshed.get("stop_underlying")) is None:
+        levels = await anchor_flow_levels(store, client, market_data, refreshed, now)
+        if levels:
+            refreshed.update(levels)
+            if status == "FILLED":
+                refreshed["exits_placed"] = True
+    if status in ("PENDING", "PARTIAL") and limit_expired(
+            refreshed.get("entry_placed_at"), now, profile.entry_limit_timeout_sec):
+        await cancel_if_working(alpaca, refreshed.get("entry_order_id"), status)
+        refreshed = await refresh_paper_row(alpaca, refreshed)
+        filled = _count_field(refreshed, "entry_filled")
+        if filled < 1:
+            await store.record_close(
+                str(refreshed.get("underlying") or ""), "FlowVWAP", profile.mode,
+                str(refreshed.get("symbol") or ""),
+                f"flowvwap-limit-timeout-{refreshed.get('opened_alert_id')}")
+            refreshed["status"] = "CLOSED"
+            refreshed["_limit_timeout"] = True
+            jlog("flowvwap_limit_skip", reason="limit_timeout", alert_id=refreshed.get("opened_alert_id"),
+                 order_id=refreshed.get("entry_order_id"))
+            await notify_flow_cancelled(notifier, profile, store, refreshed, "limit_timeout")
+            return refreshed
+        if parse_decimal(refreshed.get("stop_underlying")) is None:
+            levels = await anchor_flow_levels(store, client, market_data, refreshed, now)
+            if levels:
+                refreshed.update(levels)
+        refreshed["_remainder_cancelled"] = True
+        jlog("flowvwap_limit_partial", reason="limit_timeout", filled=filled,
+             order_id=refreshed.get("entry_order_id"),
+             note="partial fill is the position; the unfilled remainder was cancelled")
+        await notify_flow_cancelled(notifier, profile, store, refreshed, "limit_timeout")
+        await notify_flow_filled(notifier, profile, store, refreshed, refreshed.get("_entry_order") or {}, now)
+    if str(refreshed.get("status") or "") != "CLOSED":
+        await save_refreshed_paper(store, refreshed)
+    if str(refreshed.get("entry_status") or "").upper() == "FILLED":
+        await notify_flow_filled(notifier, profile, store, refreshed, refreshed.get("_entry_order") or {}, now)
+    return refreshed
+
+
+async def maintain_flow_limits(now: datetime, s: "Settings", store: "Store", client: "PublicClient",
+                               alpaca: Optional[AlpacaClient], market_data: Optional["AlpacaData"],
+                               notifier: Optional[NotifyClient]) -> None:
+    """Timeout and fill check for resting FlowVWAP limits. Used by the monitor and any PAPER webhook."""
+    if s.mode != "PAPER" or alpaca is None:
+        return
+    try:
+        rows = await store.list_open_positions(s.mode)
+    except (StoreError, httpx.HTTPError) as exc:
+        jlog("flowvwap_limit_maintain_failed", error=type(exc).__name__)
+        return
+    for row in rows:
+        if str(row.get("strategy") or "") != "FlowVWAP" or not row.get("entry_placed_at"):
+            continue
+        status = str(row.get("entry_status") or "").upper()
+        if status not in ("PENDING", "PARTIAL", "FILLED"):
+            continue
+        try:
+            await settle_flow_limit(row, now, s, store, client, alpaca, market_data, notifier)
+        except (Reject, StoreError, httpx.HTTPError) as exc:
+            jlog("flowvwap_limit_maintain_failed", error=type(exc).__name__)
+
+
 async def run_paper_alert(payload: dict, alert_id: str, day: str, now: datetime, s: "Settings",
                           store: "Store", public: "PublicClient", alpaca: AlpacaClient,
                           sleep: Callable[[float], Any], respond: Callable[..., JSONResponse],
-                          market_data: Optional["AlpacaData"] = None) -> JSONResponse:
+                          market_data: Optional["AlpacaData"] = None,
+                          notifier: Optional[NotifyClient] = None) -> JSONResponse:
     """Place the Public.com-selected contract on Alpaca paper, then the exits once it fills."""
     selection: Optional[dict] = None
     entry_slot = None
     exit_slot = None
     broker_sent = False
+    base = s
     try:
-        s = s.for_strategy(strategy_name(payload))
+        await maintain_flow_limits(now, base, store, public, alpaca, market_data, notifier)
+        s = base.for_strategy(strategy_name(payload))
         kind, symbol = classify_symbol(payload.get("symbol", ""))
         if kind == "underlying":
             strategy = strategy_name(payload)
@@ -2713,7 +3042,8 @@ async def run_paper_alert(payload: dict, alert_id: str, day: str, now: datetime,
             await store.log_pick(alert_id, day, s.mode, selection)
             jlog("contract_pick", alert_id=alert_id, selection=selection)
         if selection is not None and selection.get("skip_order"):
-            return await _paper_finish_flat(payload, alert_id, selection, s, store, alpaca, respond, sold=None)
+            return await _paper_finish_flat(
+                payload, alert_id, selection, s, store, alpaca, respond, sold=None, notifier=notifier)
         if s.flow_rules and selection is None and str(order_payload.get("open_close", "")).upper() == "OPEN":
             raise Reject("FlowVWAP entries must use the underlying symbol, not an OCC symbol")
         o = validate(order_payload, s)
@@ -2724,18 +3054,32 @@ async def run_paper_alert(payload: dict, alert_id: str, day: str, now: datetime,
             broker_symbol = alpaca_option_symbol(o["symbol"])
             contract = await alpaca.get_contract(broker_symbol)
             penny = contract_is_penny(contract)
-            limit = round_option_price(o["limit_price"], penny)
+            offset = flow_limit_offset(s, selection)
+            resting_limit = offset is not None
+            if resting_limit:
+                # Checked before the daily cap. A non-positive limit is not an entry.
+                priced = flow_entry_limit(o["limit_price"], offset, penny)
+                if priced is None:
+                    jlog("flowvwap_limit_skip", reason="limit_non_positive", alert_id=alert_id,
+                         mid=price_text(o["limit_price"]), offset=format(offset, "f"))
+                    raise Reject("FlowVWAP limit entry skipped: limit_non_positive")
+                limit = priced
+            else:
+                limit = round_option_price(o["limit_price"], penny)
             # Closes are not checked again. A fill above the cap still has to be sellable.
             if s.max_premium is not None and limit > s.max_premium:
                 raise Reject(f"limit_price {limit} exceeds MAX_PREMIUM {s.max_premium}")
+            # Counted when the limit is placed, same as an immediate entry. A later
+            # limit_timeout does not give the slot back. A broker cancel with zero
+            # shares during this request still releases, below.
             notional = limit * o["qty"] * 100
             reason = await store.try_consume(day, s.mode, notional, True, s, is_exit=False, exit_counts=False)
             if reason:
                 raise Reject(reason)
             slot = cap_slot(day, s.mode, notional, True, False, False)
             entry_slot = slot
-            body = alpaca_limit_order(broker_symbol, o["qty"], "buy", "buy_to_open", limit,
-                                      str(uuid.uuid4()))
+            client_order_id = paper_client_id(f"flow-limit:{alert_id}") if resting_limit else str(uuid.uuid4())
+            body = alpaca_limit_order(broker_symbol, o["qty"], "buy", "buy_to_open", limit, client_order_id)
             placed = await alpaca.place(body)
             broker_sent = True
             entry_slot = None
@@ -2753,7 +3097,12 @@ async def run_paper_alert(payload: dict, alert_id: str, day: str, now: datetime,
                 raise Reject("Alpaca entry was not filled", 502)
             take_profit: dict
             stop: dict
-            if entry_status == "FILLED":
+            anchored: Optional[dict] = None
+            if resting_limit and entry_status != "FILLED":
+                blank = {"attached": False, "quantity": 0, "status": "NONE", "reason": flowvwap.UNDERLYING_EXIT}
+                take_profit = {**blank, "qty_open": 0, "runners": 0}
+                stop = dict(blank)
+            elif entry_status == "FILLED":
                 price = fill_price(polled, limit)
                 provisional = {
                     "symbol": broker_symbol, "qty": o["qty"], "entry_order_id": placed.get("id"),
@@ -2761,6 +3110,10 @@ async def run_paper_alert(payload: dict, alert_id: str, day: str, now: datetime,
                 }
                 take_profit, stop = await submit_paper_exits(
                     alpaca, store, s, day, provisional, price, penny)
+                if resting_limit and selection is not None:
+                    anchored = await anchor_flow_levels(store, public, market_data, {
+                        "underlying": selection["underlying"], "entry_side": selection["entry_side"],
+                    }, now)
             else:
                 if s.take_profit:
                     take_profit = _exit_report(False, 0, status="NONE", reason="waiting for the entry to fill")
@@ -2780,6 +3133,25 @@ async def run_paper_alert(payload: dict, alert_id: str, day: str, now: datetime,
                 apply_exit_reports(row, take_profit, stop)
                 if entry_status != "FILLED":
                     row["exits_placed"] = False
+                entry_u = selection.get("entry_underlying")
+                stop_u = selection.get("stop_underlying")
+                target_u = selection.get("target_underlying")
+                placed_at = None
+                alert_u = None
+                if resting_limit:
+                    # Stops wait for the fill. alert_underlying keeps SPY from the alert.
+                    placed_at = as_et(now).isoformat()
+                    alert_u = selection.get("entry_underlying")
+                    if anchored:
+                        entry_u = anchored["entry_underlying"]
+                        stop_u = anchored["stop_underlying"]
+                        target_u = anchored["target_underlying"]
+                        row["exits_placed"] = True
+                    else:
+                        entry_u = stop_u = target_u = None
+                        row["exits_placed"] = False
+                    jlog("flowvwap_limit_entry", alert_id=alert_id, order_id=placed.get("id"),
+                         limit=price_text(limit), mid=selection.get("mid"), status=entry_status)
                 reason = await store.record_open(
                     str(selection["underlying"]), str(selection["strategy"]), s.mode, broker_symbol,
                     str(selection["entry_side"]), str(selection["right"]), o["qty"],
@@ -2790,12 +3162,23 @@ async def run_paper_alert(payload: dict, alert_id: str, day: str, now: datetime,
                     stop_filled=0, stop_limit=row.get("stop_limit"), stop_order_id=row.get("stop_order_id"),
                     stop_status=str(row.get("stop_status") or "NONE"), entry_order_id=str(placed.get("id")),
                     entry_status=entry_status, entry_filled=filled, exits_placed=bool(row.get("exits_placed")),
-                    entry_underlying=selection.get("entry_underlying"),
-                    stop_underlying=selection.get("stop_underlying"),
-                    target_underlying=selection.get("target_underlying"),
-                    regime=selection.get("regime"))
+                    entry_underlying=entry_u,
+                    stop_underlying=stop_u,
+                    target_underlying=target_u,
+                    regime=selection.get("regime"),
+                    entry_placed_at=placed_at,
+                    alert_underlying=alert_u)
                 if reason:
                     jlog("position_persist_failed", alert_id=alert_id, reason=reason)
+                elif resting_limit:
+                    notice = {
+                        "entry_order_id": placed.get("id"), "symbol": broker_symbol,
+                        "entry_limit": price_text(limit), "strategy": "FlowVWAP",
+                    }
+                    mid = str(selection.get("mid") or price_text(o["limit_price"]))
+                    await notify_flow_placed(notifier, s, store, notice, mid)
+                    if entry_status == "FILLED":
+                        await notify_flow_filled(notifier, s, store, notice, polled, now)
             await store.finish(alert_id, "ACCEPTED", "OPEN", notional, s.mode, {
                 "selection": selection, "take_profit": take_profit, "stop": stop,
                 "alpaca_order_id": placed.get("id"), "entry_status": entry_status,
@@ -2811,7 +3194,8 @@ async def run_paper_alert(payload: dict, alert_id: str, day: str, now: datetime,
             raise Reject(reason)
         slot = cap_slot(day, s.mode, o["notional"], False, True, False)
         exit_slot = None
-        return await _paper_sell_close(payload, alert_id, selection, o, s, store, alpaca, respond, slot)
+        return await _paper_sell_close(
+            payload, alert_id, selection, o, s, store, alpaca, respond, slot, notifier)
     except Reject as exc:
         if entry_slot is not None and not broker_sent:
             await _paper_release(store, entry_slot)
@@ -2826,9 +3210,10 @@ async def run_paper_alert(payload: dict, alert_id: str, day: str, now: datetime,
 
 async def _paper_finish_flat(payload: dict, alert_id: str, selection: dict, s: "Settings", store: "Store",
                              alpaca: AlpacaClient, respond: Callable[..., JSONResponse],
-                             sold: Optional[dict]) -> JSONResponse:
+                             sold: Optional[dict], notifier: Optional[NotifyClient] = None) -> JSONResponse:
     stored = await store.get_position(str(selection["underlying"]), str(selection["strategy"]), s.mode)
     cancelled: list[str] = []
+    was_working = bool(stored) and str((stored or {}).get("entry_status") or "").upper() in ("PENDING", "PARTIAL")
     if stored:
         cancelled = await cancel_paper_working(alpaca, stored)
         refreshed = await refresh_paper_row(alpaca, stored)
@@ -2846,6 +3231,8 @@ async def _paper_finish_flat(payload: dict, alert_id: str, selection: dict, s: "
         await store.finish(alert_id, "REJECTED", mode=s.mode, detail=audit_detail(selection, reason=reason))
         return respond(409, error_body(alert_id, reason, selection))
     note = str(selection.get("note") or "Nothing remains open, so no sell is sent.")
+    if was_working and selection.get("strategy") == "FlowVWAP" and stored:
+        await notify_flow_cancelled(notifier, s.for_strategy("FlowVWAP"), store, stored, "flat")
     await store.finish(alert_id, "ACCEPTED", "CLOSE", Decimal(0), s.mode,
                        audit_detail(selection, contracts_closed=0, note=note, cancelled_order_ids=cancelled))
     body = {"ok": True, "mode": s.mode, "alert_id": alert_id, "order_placed": False, "broker": "alpaca",
@@ -2860,12 +3247,16 @@ async def _paper_finish_flat(payload: dict, alert_id: str, selection: dict, s: "
 
 async def _paper_sell_close(payload: dict, alert_id: str, selection: Optional[dict], order: dict, s: "Settings",
                             store: "Store", alpaca: AlpacaClient, respond: Callable[..., JSONResponse],
-                            slot: tuple) -> JSONResponse:
+                            slot: tuple, notifier: Optional[NotifyClient] = None) -> JSONResponse:
     cancelled: list[str] = []
+    entry_snapshot: Optional[dict] = None
+    was_working = False
     if selection is not None:
         stored = await store.get_position(str(selection["underlying"]), str(selection["strategy"]), s.mode)
         if stored:
             live = await refresh_paper_row(alpaca, stored)
+            entry_snapshot = live
+            was_working = str(live.get("entry_status") or "").upper() in ("PENDING", "PARTIAL")
             planned = exit_plan(live)
             cancelled = await cancel_paper_working(alpaca, live)
             live = await refresh_paper_row(alpaca, live)
@@ -2890,7 +3281,8 @@ async def _paper_sell_close(payload: dict, alert_id: str, selection: Optional[di
                     "stop_filled": plan["stop_filled"], "cancel_take_profit": plan["cancel_take_profit"],
                     "cancel_stop": plan["cancel_stop"],
                 })
-                return await _paper_finish_flat(payload, alert_id, selection, s, store, alpaca, respond, sold=None)
+                return await _paper_finish_flat(
+                    payload, alert_id, selection, s, store, alpaca, respond, sold=None, notifier=notifier)
             order = {**order, "qty": plan["still_open"], "notional": order["limit_price"] * plan["still_open"] * 100}
             selection = dict(selection)
             selection.update({
@@ -2942,6 +3334,13 @@ async def _paper_sell_close(payload: dict, alert_id: str, selection: Optional[di
             response["cancel_take_profit"] = selection["cancel_take_profit"]
         if selection.get("cancel_stop"):
             response["cancel_stop"] = selection["cancel_stop"]
+        if selection.get("strategy") == "FlowVWAP":
+            profile = s.for_strategy("FlowVWAP")
+            snap = entry_snapshot or {}
+            if was_working:
+                await notify_flow_cancelled(notifier, profile, store, snap, "flat")
+            await notify_flow_exit(
+                notifier, profile, store, snap, "flat", int(order["qty"]), limit, snap.get("_entry_order"))
     return respond(200, response)
 
 
@@ -3024,7 +3423,8 @@ async def option_close_limit(client: "PublicClient", symbol: str, fallback: Limi
 
 async def run_flow_monitor(now: datetime, s: "Settings", store: "Store", client: "PublicClient",
                            alpaca: Optional[AlpacaClient],
-                           market_data: Optional[AlpacaData]) -> dict:
+                           market_data: Optional[AlpacaData],
+                           notifier: Optional[NotifyClient] = None) -> dict:
     """Stop, target, and 11:30 flatten for open FlowVWAP positions. Safe to call every minute.
 
     A second call sees the row already closed, or reuses the Alpaca client order id, so it
@@ -3037,7 +3437,8 @@ async def run_flow_monitor(now: datetime, s: "Settings", store: "Store", client:
         if str(row.get("strategy") or "") != "FlowVWAP":
             continue
         try:
-            actions.append(await _monitor_flow_row(row, now, s, store, client, alpaca, market_data))
+            actions.append(await _monitor_flow_row(
+                row, now, s, store, client, alpaca, market_data, notifier))
         except Reject as exc:
             actions.append({
                 "underlying": row.get("underlying"), "strategy": "FlowVWAP",
@@ -3048,8 +3449,16 @@ async def run_flow_monitor(now: datetime, s: "Settings", store: "Store", client:
 
 
 async def _monitor_flow_row(row: dict, now: datetime, s: "Settings", store: "Store", client: "PublicClient",
-                            alpaca: Optional[AlpacaClient], market_data: Optional[AlpacaData]) -> dict:
+                            alpaca: Optional[AlpacaClient], market_data: Optional[AlpacaData],
+                            notifier: Optional[NotifyClient] = None) -> dict:
+    if s.mode == "PAPER" and alpaca is not None and row.get("entry_placed_at"):
+        row = await settle_flow_limit(row, now, s, store, client, alpaca, market_data, notifier)
     symbol = str(row.get("underlying") or "")
+    if row.get("_limit_timeout"):
+        return {
+            "underlying": symbol, "strategy": "FlowVWAP", "action": "skip", "reason": "limit_timeout",
+            "order_placed": False, "cancelled": True, "order_id": row.get("entry_order_id"),
+        }
     side = str(row.get("entry_side") or "")
     price = await underlying_mark(client, market_data, symbol, now)
     signal = flowvwap.exit_signal(
@@ -3059,9 +3468,15 @@ async def _monitor_flow_row(row: dict, now: datetime, s: "Settings", store: "Sto
         "entry_underlying": dec_text(parse_decimal(row.get("entry_underlying"))),
         "stop_underlying": dec_text(parse_decimal(row.get("stop_underlying"))),
         "target_underlying": dec_text(parse_decimal(row.get("target_underlying"))),
+        "entry_filled": _count_field(row, "entry_filled"),
     }
+    if row.get("_remainder_cancelled"):
+        report["remainder"] = "cancelled"
     if signal is None:
-        report["action"] = "hold"
+        working = str(row.get("entry_status") or "").upper() in ("PENDING", "PARTIAL")
+        report["action"] = "working" if working else "hold"
+        if working:
+            report["limit"] = row.get("entry_limit")
         return report
     plan = exit_plan(row)
     qty = int(plan["still_open"])
@@ -3070,12 +3485,19 @@ async def _monitor_flow_row(row: dict, now: datetime, s: "Settings", store: "Sto
     occ = str(row.get("symbol") or "")
     alert_id = f"flowvwap-monitor-{signal}-{row.get('opened_alert_id')}"
     if qty < 1:
+        cancelled = False
+        if s.mode == "PAPER" and alpaca is not None:
+            cancelled = await cancel_if_working(alpaca, row.get("entry_order_id"), row.get("entry_status"))
         reason = await store.record_close(
             symbol, "FlowVWAP", s.mode, occ, alert_id,
             tp_status=plan["tp_status_after"], stop_status=plan["stop_status_after"],
             tp_filled=plan["tp_filled"], stop_filled=plan["stop_filled"])
         report["order_placed"] = False
-        report["note"] = reason or "nothing left open"
+        report["cancelled"] = cancelled
+        report["note"] = reason or ("working limit cancelled" if cancelled else "nothing left open")
+        if cancelled:
+            await notify_flow_cancelled(
+                notifier, s.for_strategy("FlowVWAP"), store, row, exit_email_reason(signal or "flatten"))
         return report
     limit: Optional[Decimal] = None
     try:
@@ -3090,7 +3512,8 @@ async def _monitor_flow_row(row: dict, now: datetime, s: "Settings", store: "Sto
             report["order_placed"] = False
             report["error"] = "Alpaca is not configured" if alpaca is None else "no option quote"
             return report
-        return await _paper_flow_exit(report, row, alpaca, store, s, occ, qty, limit, alert_id, plan)
+        return await _paper_flow_exit(
+            report, row, alpaca, store, s, occ, qty, limit, alert_id, plan, notifier)
     if s.mode == "LIVE":
         if limit is None:
             report["order_placed"] = False
@@ -3126,9 +3549,11 @@ async def _monitor_flow_row(row: dict, now: datetime, s: "Settings", store: "Sto
 
 
 async def _paper_flow_exit(report: dict, row: dict, alpaca: AlpacaClient, store: "Store", s: "Settings",
-                           occ: str, qty: int, limit: Decimal, alert_id: str, plan: dict) -> dict:
+                           occ: str, qty: int, limit: Decimal, alert_id: str, plan: dict,
+                           notifier: Optional[NotifyClient] = None) -> dict:
     client_id = paper_client_id(f"flow-exit:{row.get('opened_alert_id')}")
     existing = await alpaca.order_by_client(client_id)
+    was_working = str(row.get("entry_status") or "").upper() in ("PENDING", "PARTIAL")
     if existing is None:
         await cancel_paper_working(alpaca, row)
         body = alpaca_limit_order(
@@ -3150,6 +3575,12 @@ async def _paper_flow_exit(report: dict, row: dict, alpaca: AlpacaClient, store:
         report["error"] = reason
     jlog("flowvwap_exit", action=report.get("action"), qty=qty, order_id=placed.get("id"),
          idempotent=existing is not None, order=body)
+    profile = s.for_strategy("FlowVWAP")
+    reason_label = exit_email_reason(str(report.get("action") or ""))
+    if was_working:
+        await notify_flow_cancelled(notifier, profile, store, row, reason_label)
+    await notify_flow_exit(
+        notifier, profile, store, row, reason_label, qty, limit, row.get("_entry_order"))
     return report
 
 
@@ -3159,11 +3590,13 @@ def create_app(settings: Optional[Settings] = None,
                store_transport: Optional[httpx.AsyncBaseTransport] = None,
                clock: Callable[[], datetime] = lambda: datetime.now(ET),
                alpaca_transport: Optional[httpx.AsyncBaseTransport] = None,
-               sleeper: Optional[Callable[[float], Any]] = None) -> FastAPI:
+               sleeper: Optional[Callable[[float], Any]] = None,
+               notify_transport: Optional[httpx.AsyncBaseTransport] = None) -> FastAPI:
     s = settings or Settings.from_env()
     store = Store(s.supabase_url, s.supabase_key, store_transport)
     client = PublicClient(s, transport)
     alpaca = AlpacaClient(s, alpaca_transport) if s.mode == "PAPER" else None
+    notifier = NotifyClient(secrets=notify_secrets(s), transport=notify_transport)
     market_data = AlpacaData(s.alpaca_key_id, s.alpaca_secret_key, alpaca_transport) if (
         s.alpaca_key_id and s.alpaca_secret_key) else None
     sleep = sleeper or asyncio.sleep
@@ -3256,7 +3689,7 @@ def create_app(settings: Optional[Settings] = None,
         if not cron_authorized(request):
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
         try:
-            report = await run_flow_monitor(clock(), s, store, client, alpaca, market_data)
+            report = await run_flow_monitor(clock(), s, store, client, alpaca, market_data, notifier)
         except (StoreError, httpx.HTTPError) as exc:
             jlog("flowvwap_monitor_failed", error=type(exc).__name__)
             return JSONResponse({"ok": False, "error": "store unavailable"}, status_code=503)
@@ -3316,7 +3749,7 @@ def create_app(settings: Optional[Settings] = None,
             if alpaca is None:
                 return respond(503, {"ok": False, "alert_id": alert_id, "error": "Alpaca is not configured"})
             return await run_paper_alert(
-                payload, alert_id, day, now, s, store, client, alpaca, sleep, respond, market_data)
+                payload, alert_id, day, now, s, store, client, alpaca, sleep, respond, market_data, notifier)
         releases: list[tuple] = []
         selection: Optional[dict] = None
         try:
