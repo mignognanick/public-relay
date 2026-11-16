@@ -25,6 +25,10 @@
   `0006_flowvwap_levels.sql` adds the entry underlying prices and `daily_levels`. Apply it
   after `0005` before this version serves FlowVWAP. QQQ opens still record if the new
   columns are left null.
+  `0007_flowvwap_limit_and_notifications.sql` adds the resting-limit clock and the
+  notification idempotency table. Apply it after `0006` before FlowVWAP limit orders.
+  QQQ saves omit the new arguments, so they still record on a database that is only
+  through `0006`.
   `underlying_price` (`{{close}}`) sets ATM; if it is missing, the relay uses the equity quote.
   The pick is written to `contract_picks` and returned as `selection`, with the order that would have been
   sent as `order`. Templates are in `sample_alert.json`. Defaults stay MODE=PREFLIGHT.
@@ -69,7 +73,11 @@ are unchanged: LIVE still requires both `MODE=LIVE` and `LIVE_CONFIRM=I_UNDERSTA
 | `STOP_LOSS_PERCENT` | empty | Off when empty. When set, stop price is entry × (1 − this / 100), then rounded to the option tick. `30` on a 1.45 entry is 1.015, which is sent as 1.02. Must be greater than 0 and less than 100. Overridable per strategy. `null` in a profile turns the stop off for that strategy even when this variable is set. |
 | `SUPABASE_URL` | empty | Project URL. |
 | `SUPABASE_SERVICE_KEY` | empty | Service-role key. Server only. |
-| `CRON_SECRET` | empty | Bearer token for `GET /keepalive`. |
+| `CRON_SECRET` | empty | Bearer token for `GET /keepalive` and `/flowvwap-monitor`. |
+| `NOTIFY_EMAIL_ENABLED` | `false` | Master switch for order emails. Off sends nothing. PAPER only. |
+| `RESEND_API_KEY` | empty | Resend API key. Read when email is on. Not logged and not put in `/health`. |
+| `NOTIFY_EMAIL_FROM` | empty | From address Resend will accept. Not logged and not put in `/health`. |
+| `NOTIFY_EMAIL_TO` | empty | Comma-separated recipients. Not logged and not put in `/health`. |
 
 `/health` returns every tunable above except the secrets. `settings.strategies` is the effective per-strategy block (built-in profiles plus `STRATEGY_OVERRIDES`). A strategy that is not listed there uses the global `settings` values. `FlowVWAP`, `QQQ_EMA_VWAP`, `PremarketES`, and `PremarketES_MU` are listed. `settings.daily_caps` is `shared`.
 
@@ -77,7 +85,7 @@ are unchanged: LIVE still requires both `MODE=LIVE` and `LIVE_CONFIRM=I_UNDERSTA
 
 Checked-in defaults live in `BUILTIN_STRATEGY_OVERRIDES` in `api/index.py`. That is the source that ships without an env edit. `STRATEGY_OVERRIDES` is optional JSON and replaces individual keys for a strategy; omitted keys keep the built-in value, then the global env. The strategy name must match the alert's `strategy` field exactly. No Vercel variable has to change for `QQQ_EMA_VWAP`.
 
-Overridable keys: `delta_band_min`, `delta_band_max`, `itm_points`, `otm_points`, `max_premium`, `tp_percent`, `tp_single`, `take_profit`, `stop_loss_percent`, `max_qty`, `order_qty`, `flow_rules`. `max_premium: null` removes that strategy's open cap. `otm_points` is how far out of the money a strike may be (0–80). `0` keeps the ATM-through-ITM window. `take_profit: false` skips the premium take-profit for that strategy, including a 5-lot, which `TP_FRACTION` cannot do from a profile. Daily caps, expiry, limit fallbacks, and mode are not overridable.
+Overridable keys: `delta_band_min`, `delta_band_max`, `itm_points`, `otm_points`, `max_premium`, `tp_percent`, `tp_single`, `take_profit`, `stop_loss_percent`, `max_qty`, `order_qty`, `flow_rules`, `entry_limit_offset`, `entry_limit_timeout_sec`, `notify_email`. `max_premium: null` removes that strategy's open cap. `otm_points` is how far out of the money a strike may be (0–80). `0` keeps the ATM-through-ITM window. `take_profit: false` skips the premium take-profit for that strategy, including a 5-lot, which `TP_FRACTION` cannot do from a profile. Daily caps, expiry, limit fallbacks, and mode are not overridable.
 
 | Strategy | Delta | Strike window | Max premium (opens) | Exits | Qty |
 | --- | --- | --- | --- | --- | --- |
@@ -140,6 +148,14 @@ Flip skip: if the 9:30 open is within 1.00 of the UW flip (inclusive), no FlowVW
 Regime: enter only when the 9:30 open is strictly below the prior regular-hours low and Daybreak bias is `TREND_SHORT`. If the open, the prior low, or the bias is missing, the entry is allowed and logged as `unverified`.
 
 The prior low and the 9:30 open come from Public.com regular-hours bars (`WEEK/ONE_DAY` and `DAY/ONE_MINUTE`). If that call fails and `MODE=PAPER` has Alpaca keys, the relay falls back to Alpaca IEX bars on `data.alpaca.markets`. It does not send orders there.
+
+PAPER limit entry (FlowVWAP only). `entry_limit_offset` defaults to `0.40` and `entry_limit_timeout_sec` to `300`. After the usual filters and the contract pick, the relay buys a DAY limit at the option mid minus `0.40`, rounded down to the option tick: `$0.01` under `$3`, and `$0.01` at every price when Alpaca's `ppind` flag is true. Otherwise `$0.05` at and above `$3`. SPY is not hard-coded as penny-pilot; `ppind` is the penny program. A price that is positive but under one tick is raised to that tick. If mid minus the offset is `<= 0`, the entry is skipped and logged `limit_non_positive`, and it does not spend the daily cap. `null`, blank, or `0` (or removing the key) restores the immediate buy at the mid. PremarketES, PremarketES_MU, and QQQ_EMA_VWAP do not read the offset.
+
+The working order (Alpaca id, limit, alert id, placed-at clock, SPY at the alert) is stored on the open position. `/flowvwap-monitor` and any later PAPER webhook check it. If it is still unfilled after 300 seconds, it is cancelled and logged `limit_timeout`. The daily order cap was already counted when the limit was placed, and the timeout does not give that slot back. A partial fill is left working until the timeout, a flat alert, or the 11:30 flatten; then the unfilled remainder is cancelled and the filled quantity is the position. A flat alert or the 11:30 flatten while the limit is still working cancels it, and sells whatever has filled.
+
+Stops are measured from SPY at the fill, not from SPY at the alert. The monitor fetches the SPY quote when it first sees the fill. Fill-time is the better anchor for a resting limit: the stop and target are the risk box of the trade you actually have. Alert-time would arm them around a price that can be minutes stale, so a fill after SPY has already moved 0.50 would stop out on the next tick. The room-to-King check still uses SPY at the alert, before the order is sent. A fill is kept even if King has since moved closer.
+
+Order email is off until configured. FlowVWAP's `notify_email` flag is true and the other profiles are false, but `NOTIFY_EMAIL_ENABLED` defaults to false, so nothing is sent. When that flag is true and `RESEND_API_KEY`, `NOTIFY_EMAIL_FROM`, and `NOTIFY_EMAIL_TO` are set, PAPER FlowVWAP events send one Resend email each: limit placed (contract, limit, mid at the alert), filled (fill price, fill time ET), cancelled (`limit_timeout`, `flat`, or `11:30`), and exit (`stop`, `target`, `flat`, or `11:30`) with dollar P&L per contract and total. P&L uses the entry fill against the exit limit, times 100, because the sell is only being placed. A failed send is logged and does not change the order. The same event is not sent twice; a failed send can be retried on a later tick. Passphrases, `CRON_SECRET`, `RELAY_CRON_SECRET`, and API keys are not put in the message or the log. This repo does not set any of those variables.
 
 `POST /levels` stores the day's UW levels. Auth is `Authorization: Bearer $CRON_SECRET` (the same secret as `/keepalive`). Body:
 

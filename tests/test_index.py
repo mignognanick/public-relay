@@ -51,6 +51,7 @@ class FakeSupabase:
     def __init__(self, fail=False, missing_position_rpc=False):
         self.alerts, self.counters, self.fail, self.calls = {}, {}, fail, []
         self.positions, self.picks, self.exit_orders, self.levels = {}, [], {}, {}
+        self.notifications = set()
         self.missing_position_rpc = missing_position_rpc
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
@@ -138,6 +139,8 @@ class FakeSupabase:
                 "stop_underlying": b.get("p_stop_underlying"),
                 "target_underlying": b.get("p_target_underlying"),
                 "regime": b.get("p_regime"),
+                "entry_placed_at": b.get("p_entry_placed_at"),
+                "alert_underlying": b.get("p_alert_underlying"),
             }
             return httpx.Response(200, content=b"null", headers={"content-type": "application/json"})
         if p == "/rest/v1/rpc/relay_record_close":
@@ -187,7 +190,22 @@ class FakeSupabase:
                 "exits_placed": b.get("p_exits_placed") is True,
                 "qty_open": b.get("p_qty_open"),
             })
+            if b.get("p_write_levels"):
+                row["entry_underlying"] = b.get("p_entry_underlying")
+                row["stop_underlying"] = b.get("p_stop_underlying")
+                row["target_underlying"] = b.get("p_target_underlying")
+                row["entry_placed_at"] = b.get("p_entry_placed_at")
+                row["alert_underlying"] = b.get("p_alert_underlying")
             return httpx.Response(200, content=b"null", headers={"content-type": "application/json"})
+        if p == "/rest/v1/rpc/relay_claim_notification":
+            key = b["p_event_key"]
+            if key in self.notifications:
+                return httpx.Response(200, json=False)
+            self.notifications.add(key)
+            return httpx.Response(200, json=True)
+        if p == "/rest/v1/rpc/relay_release_notification":
+            self.notifications.discard(b["p_event_key"])
+            return httpx.Response(200, json=True)
         if p == "/rest/v1/rpc/relay_get_levels":
             row = self.levels.get((b["p_day"], b["p_symbol"]))
             if not row:
@@ -286,7 +304,7 @@ class FakeAlpaca:
 
 
 def make(tmp_path, mode="PREFLIGHT", confirm="", clock=lambda: OPEN_TIME, sb=None, public=None,
-         alpaca=None, **over):
+         alpaca=None, notify=None, **over):
     env = {"PUBLIC_SECRET": SECRET, "WEBHOOK_PASSPHRASE": PASS, "MODE": mode, "LIVE_CONFIRM": confirm,
            "ALLOWLIST": "AAPL,SPY", "SUPABASE_URL": "https://x.supabase.co", "SUPABASE_SERVICE_KEY": "svc-key", **over}
     fake = public or FakePublic()
@@ -297,12 +315,15 @@ def make(tmp_path, mode="PREFLIGHT", confirm="", clock=lambda: OPEN_TIME, sb=Non
         env.setdefault("ALPACA_SECRET_KEY", "alpaca-secret")
         alpaca = alpaca if alpaca is not None else FakeAlpaca()
         alpaca_transport = httpx.MockTransport(alpaca)
+    notify_transport = httpx.MockTransport(notify) if notify is not None else None
     a = relay.create_app(relay.Settings.from_env(env), transport=httpx.MockTransport(fake),
                          store_transport=httpx.MockTransport(sb), clock=clock,
-                         alpaca_transport=alpaca_transport, sleeper=_no_sleep)
+                         alpaca_transport=alpaca_transport, sleeper=_no_sleep,
+                         notify_transport=notify_transport)
     c = TestClient(a)
     c.sb = sb
     c.alpaca = alpaca
+    c.notify = notify
     return c, fake
 
 

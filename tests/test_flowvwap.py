@@ -385,7 +385,11 @@ def test_paper_monitor_sells_once(tmp_path, monkeypatch):
     client, _fake = make(
         tmp_path, mode="PAPER", public=public, alpaca=broker, clock=lambda: clock["now"],
         MAX_DAILY_OPENS="5000")
+    # The limit fills immediately. Stops are anchored to this SPY quote, then the
+    # monitor sees the price fall through that stop.
+    public.quotes["SPY"]["last"] = "580"
     opened = client.post("/webhook", json=flow_alert(alert_id="paper-open"))
+    public.quotes["SPY"]["last"] = "579.40"
     assert opened.status_code == 200, opened.text
     assert opened.json()["order_placed"] is True
     assert opened.json()["take_profit"]["reason"] == flowvwap.UNDERLYING_EXIT
