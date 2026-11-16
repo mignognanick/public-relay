@@ -4,6 +4,10 @@ Vercel + Supabase port. Review-only. Defaults to MODE=PREFLIGHT, which never pla
 LIVE requires BOTH MODE=LIVE and LIVE_CONFIRM=I_UNDERSTAND. MODE=PAPER does not. It places the
 selected contract on Alpaca's paper host and does not use LIVE_CONFIRM.
 
+When both live switches are on, only strategies in LIVE_STRATEGY_CEILING (PremarketES) place
+on Public.com. LIVE_STRATEGIES can remove names from that set and cannot add any. Every other
+strategy keeps the Alpaca paper path. Live PremarketES buys 1 contract, with its own daily cap.
+
 A full OCC symbol is forwarded as sent. An underlying such as SPY selects a call (BUY) or put
 (SELL) for the configured expiry, or sells the stored runners when the alert flattens or flips.
 Positions are one row per underlying + strategy + mode, so a QQQ flatten cannot close SPY.
@@ -11,9 +15,10 @@ Per-strategy selection and exit overrides live in BUILTIN_STRATEGY_OVERRIDES; ST
 (JSON) replaces individual keys. FlowVWAP uses underlying exits and a 09:30-11:30 window.
 QQQ_EMA_VWAP keeps its premium take-profit profile. PremarketES buys a slightly OTM SPY
 contract and flattens only when its own close alert arrives. PremarketES_MU does the same
-for MU, with a wider OTM window aimed at delta 0.125-0.15. Daily order and spend caps stay shared.
+for MU, with a wider OTM window aimed at delta 0.125-0.15. Daily order and spend caps stay shared
+on the paper and preflight books. The live book has its own caps and is only PremarketES.
 Selection stays on Public.com. PAPER then checks the OCC symbol at Alpaca and places the entry,
-take-profit, and optional stop there. LIVE still places only the order under consideration.
+take-profit, and optional stop there. A live PremarketES entry is a DAY limit after preflight.
 """
 from __future__ import annotations
 
@@ -61,6 +66,15 @@ PAPER_SPY_QQQ_CUTOFF = dtime(15, 30)
 PAPER_OTHER_CUTOFF = dtime(15, 15)
 PAPER_FILL_POLLS = 5
 PAPER_FILL_WAIT_S = 0.5
+# Live orders are a separate book from Alpaca paper. The ceiling is the only set that can
+# send a Public.com order. LIVE_STRATEGIES may remove names from it. It cannot add one.
+LIVE_STRATEGY_CEILING = frozenset({"PremarketES"})
+LIVE_QTY = 1
+LIVE_MAX_ORDERS_CEILING = 1
+LIVE_MAX_PREMIUM_CEILING = Decimal("2.50")
+# 1 contract at the premium ceiling. A ~$500 cash account keeps the rest in reserve, and
+# option premium settles the next session, so one entry is the whole live day.
+LIVE_MAX_DAILY_OPENS_CEILING = Decimal("250.00")
 # Defaults. Each one is overridable from the environment; see Settings.from_env.
 ITM_POINTS = Decimal("5")
 DELTA_LO = Decimal("0.50")
@@ -347,6 +361,42 @@ def _effective_mode(requested: str, live_ok: bool) -> str:
     return "PREFLIGHT"
 
 
+def _live_strategies(env: dict) -> frozenset[str]:
+    """Names that may route to Public.com when MODE=LIVE and LIVE_CONFIRM match.
+
+    Blank means the built-in ceiling (PremarketES). Any other name is ignored, so an env
+    edit cannot put FlowVWAP, QQQ, or a new strategy onto the live book.
+    """
+    text = _env_text(env, "LIVE_STRATEGIES")
+    if text == "":
+        return LIVE_STRATEGY_CEILING
+    requested: list[str] = []
+    for part in text.split(","):
+        name = part.strip()
+        if name == "":
+            continue
+        if not STRATEGY_RE.match(name):
+            raise ValueError(f"LIVE_STRATEGIES name {name!r} is not a valid strategy name")
+        requested.append(name)
+    return frozenset(name for name in requested if name in LIVE_STRATEGY_CEILING)
+
+
+def _live_premium(env: dict) -> Decimal:
+    value = _env_decimal(env, "LIVE_MAX_PREMIUM", "2.50")
+    if value <= 0 or value > LIVE_MAX_PREMIUM_CEILING:
+        raise ValueError(
+            f"LIVE_MAX_PREMIUM must be greater than 0 and at most {LIVE_MAX_PREMIUM_CEILING}")
+    return value
+
+
+def _live_daily_opens(env: dict) -> Decimal:
+    value = _env_decimal(env, "LIVE_MAX_DAILY_OPENS", "250.00")
+    if value <= 0 or value > LIVE_MAX_DAILY_OPENS_CEILING:
+        raise ValueError(
+            f"LIVE_MAX_DAILY_OPENS must be greater than 0 and at most {LIVE_MAX_DAILY_OPENS_CEILING}")
+    return value
+
+
 @dataclass
 class Settings:
     public_secret: str = ""
@@ -383,6 +433,13 @@ class Settings:
     alpaca_base_url: str = ""
     # Env layer only. Built-in profiles are applied in for_strategy and are not stored here.
     strategy_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Live book. These do not change PAPER or PREFLIGHT sizing. close_limit_at_bid is set
+    # only on the live execution copy, so a paper flatten still sells the mid.
+    live_strategies: frozenset[str] = field(default_factory=lambda: frozenset(LIVE_STRATEGY_CEILING))
+    live_max_orders_per_day: int = LIVE_MAX_ORDERS_CEILING
+    live_max_premium: Decimal = LIVE_MAX_PREMIUM_CEILING
+    live_max_daily_opens: Decimal = LIVE_MAX_DAILY_OPENS_CEILING
+    close_limit_at_bid: bool = False
 
     def overridable_view(self) -> dict[str, Any]:
         """Effective selection and exit fields a strategy profile can replace. No secrets."""
@@ -446,6 +503,12 @@ class Settings:
             "alpaca_configured": bool(self.alpaca_key_id and self.alpaca_secret_key),
             "strategies": self.strategy_public_view(),
             "daily_caps": "shared",
+            "live_strategies": sorted(self.live_strategies),
+            "live_qty": LIVE_QTY,
+            "live_max_orders_per_day": self.live_max_orders_per_day,
+            "live_max_premium": format(self.live_max_premium, "f"),
+            "live_max_daily_opens": format(self.live_max_daily_opens, "f"),
+            "live_account_configured": bool(self.account_id),
         }
 
     def _validate_strategy_profiles(self) -> None:
@@ -470,6 +533,21 @@ class Settings:
             alpaca_base_url = _paper_base_url(e)
             if not alpaca_key_id or not alpaca_secret_key:
                 raise ValueError("MODE=PAPER requires ALPACA_KEY_ID and ALPACA_SECRET_KEY")
+        elif mode == "LIVE":
+            # Other strategies stay on Alpaca paper. Keys stay optional so a live PremarketES
+            # entry is not blocked when paper is unconfigured; those other strategies then
+            # fail closed instead of falling through to Public.com.
+            alpaca_key_id = _env_text(e, "ALPACA_KEY_ID")
+            alpaca_secret_key = _env_text(e, "ALPACA_SECRET_KEY")
+            if alpaca_key_id or alpaca_secret_key or _env_text(e, "ALPACA_BASE_URL"):
+                if not alpaca_key_id or not alpaca_secret_key:
+                    raise ValueError(
+                        "MODE=LIVE paper route needs both ALPACA_KEY_ID and ALPACA_SECRET_KEY")
+                alpaca_base_url = _paper_base_url(e)
+            else:
+                alpaca_key_id = ""
+                alpaca_secret_key = ""
+                alpaca_base_url = ""
         else:
             alpaca_key_id = ""
             alpaca_secret_key = ""
@@ -517,6 +595,11 @@ class Settings:
             alpaca_secret_key=alpaca_secret_key,
             alpaca_base_url=alpaca_base_url,
             strategy_overrides=_parse_strategy_overrides(_env_text(e, "STRATEGY_OVERRIDES")),
+            live_strategies=_live_strategies(e),
+            live_max_orders_per_day=_env_int(
+                e, "LIVE_MAX_ORDERS_PER_DAY", LIVE_MAX_ORDERS_CEILING, 1, LIVE_MAX_ORDERS_CEILING),
+            live_max_premium=_live_premium(e),
+            live_max_daily_opens=_live_daily_opens(e),
         )
         settings._validate_strategy_profiles()
         return settings
@@ -789,6 +872,36 @@ class PublicClient:
     async def place(self, body: dict) -> httpx.Response:
         acct = await self.account_id()
         return await self._req("POST", f"/userapigateway/trading/{acct}/order", body)
+
+    async def settled_option_cash(self) -> Decimal:
+        """Settled cash a long option can spend. Margin buying power is not used.
+
+        cashOnlyBuyingPower is settled funds. optionsBuyingPower, when Public sends it,
+        can be lower, and the entry has to fit in both. A missing cash figure fails closed.
+        """
+        try:
+            account = await self.account_id()
+            response = await self._req("GET", f"/userapigateway/trading/{account}/portfolio/v2")
+        except (httpx.HTTPError, RuntimeError) as exc:
+            jlog("live_cash", ok=False, error=type(exc).__name__)
+            raise Reject("portfolio unreachable", 502) from exc
+        if response.status_code >= 400:
+            jlog("live_cash", ok=False, status=response.status_code)
+            raise Reject(f"portfolio unavailable ({response.status_code})", 502)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise Reject("portfolio returned invalid JSON", 502) from exc
+        if not isinstance(payload, dict):
+            raise Reject("portfolio returned invalid JSON", 502)
+        buying = payload.get("buyingPower")
+        if not isinstance(buying, dict):
+            raise Reject("settled cash is unavailable", 502)
+        cash = _portfolio_money(buying.get("cashOnlyBuyingPower"), "settled cash")
+        options = buying.get("optionsBuyingPower")
+        if options not in (None, ""):
+            cash = min(cash, _portfolio_money(options, "options buying power"))
+        return cash
 
     async def get_order(self, order_id: str) -> httpx.Response:
         acct = await self.account_id()
@@ -1899,7 +2012,16 @@ async def build_close(payload: dict, underlying: str, strategy: str, client: "Pu
         delta = parse_decimal(nested.get("delta"))
         if delta is not None:
             delta_source = "quote"
-    limit, limit_source = limit_from_market(bid, ask, s.close_limit_fallback)
+    if s.close_limit_at_bid:
+        # A sell at the bid is marketable. The ask is not, and a market order is not sent.
+        if bid is None or bid <= 0:
+            raise Reject("live exit needs a bid; market orders are not sent")
+        limit = bid.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if limit <= 0:
+            raise Reject("live exit needs a bid; market orders are not sent")
+        limit_source = "bid"
+    else:
+        limit, limit_source = limit_from_market(bid, ask, s.close_limit_fallback)
     chosen = Leg(symbol, strike, delta, delta_source, bid, ask)
     order_payload = {
         "symbol": symbol, "side": "SELL", "open_close": "CLOSE",
@@ -2168,6 +2290,65 @@ def order_body(o: dict) -> dict:
         "limitPrice": f"{o['limit_price']:.2f}",
         "openCloseIndicator": o["open_close"],
     }
+
+
+def live_order_id(alert_id: str, open_close: str) -> str:
+    """Stable id for one alert. Public.com treats a repeated orderId as the same order."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"public-relay:{open_close}:{alert_id}"))
+
+
+def live_execution_profile(profile: "Settings", root: "Settings") -> "Settings":
+    """Qty 1 and the live caps. Selection rules (delta, strikes) stay on the strategy profile.
+
+    STRATEGY_OVERRIDES cannot raise the live size: this copy is applied after the profile.
+    A tighter global or profile premium cap is kept.
+    """
+    premium = root.live_max_premium
+    if profile.max_premium is not None and profile.max_premium < premium:
+        premium = profile.max_premium
+    return replace(
+        profile,
+        order_qty=LIVE_QTY,
+        max_qty=LIVE_QTY,
+        max_premium=premium,
+        max_orders_per_day=root.live_max_orders_per_day,
+        max_daily_opens=root.live_max_daily_opens,
+        close_limit_at_bid=True,
+    )
+
+
+def _portfolio_money(value: Any, label: str) -> Decimal:
+    number = parse_decimal(value)
+    if number is None or number < 0:
+        raise Reject(f"{label} is unavailable", 502)
+    return number
+
+
+def preflight_buying_power(body: Any) -> Optional[Decimal]:
+    if not isinstance(body, dict) or body.get("buyingPowerRequirement") in (None, ""):
+        return None
+    number = parse_decimal(body.get("buyingPowerRequirement"))
+    if number is None or number < 0:
+        raise Reject("preflight buying power is not a number", 502)
+    return number
+
+
+def guard_live_order(order: dict, selection: Optional[dict]) -> None:
+    """Live entries buy 1 contract. Live exits sell to close no more than the open position."""
+    if order["open_close"] == "OPEN":
+        if order["side"] != "BUY" or order["qty"] != LIVE_QTY:
+            raise Reject("live entries buy 1 contract to open")
+        if selection is None or selection.get("action") != "open":
+            raise Reject("live entries select the contract from the underlying symbol")
+        return
+    if order["side"] != "SELL" or order["open_close"] != "CLOSE":
+        raise Reject("live exits are sell-to-close and cannot open a position")
+    if selection is None or selection.get("action") != "close":
+        raise Reject("live exits close the stored contract and cannot open a position")
+    opened = int(selection.get("opened_qty") or 0)
+    held = int(selection.get("contracts_closed") or 0)
+    if held < 1 or opened < 1 or order["qty"] != held or order["qty"] > opened:
+        raise Reject("live exit quantity exceeds the open contract")
 
 
 def _json(r: httpx.Response) -> Any:
@@ -3031,13 +3212,22 @@ async def run_flow_monitor(now: datetime, s: "Settings", store: "Store", client:
     does not sell twice. QQQ positions are left alone. These exits do not consume the daily
     entry cap or the exit-order cap: a full cap must not block the flatten.
     """
-    rows = await store.list_open_positions(s.mode)
+    # While PremarketES is live, FlowVWAP positions are on the paper book. The monitor
+    # must not sell them at Public.com. PREFLIGHT and PAPER keep listing their own mode.
+    book = s if s.mode != "LIVE" else replace(s, mode="PAPER")
+    rows = await store.list_open_positions(book.mode)
     actions = []
     for row in rows:
         if str(row.get("strategy") or "") != "FlowVWAP":
             continue
+        if s.mode == "LIVE" and alpaca is None:
+            actions.append({
+                "underlying": row.get("underlying"), "strategy": "FlowVWAP",
+                "action": "error", "error": "Alpaca is not configured",
+            })
+            continue
         try:
-            actions.append(await _monitor_flow_row(row, now, s, store, client, alpaca, market_data))
+            actions.append(await _monitor_flow_row(row, now, book, store, client, alpaca, market_data))
         except Reject as exc:
             actions.append({
                 "underlying": row.get("underlying"), "strategy": "FlowVWAP",
@@ -3163,7 +3353,9 @@ def create_app(settings: Optional[Settings] = None,
     s = settings or Settings.from_env()
     store = Store(s.supabase_url, s.supabase_key, store_transport)
     client = PublicClient(s, transport)
-    alpaca = AlpacaClient(s, alpaca_transport) if s.mode == "PAPER" else None
+    alpaca_on = s.mode == "PAPER" or (
+        s.mode == "LIVE" and bool(s.alpaca_key_id and s.alpaca_secret_key))
+    alpaca = AlpacaClient(s, alpaca_transport) if alpaca_on else None
     market_data = AlpacaData(s.alpaca_key_id, s.alpaca_secret_key, alpaca_transport) if (
         s.alpaca_key_id and s.alpaca_secret_key) else None
     sleep = sleeper or asyncio.sleep
@@ -3171,6 +3363,8 @@ def create_app(settings: Optional[Settings] = None,
 
     if s.requested_mode == "LIVE" and s.mode != "LIVE":
         jlog("live_refused", reason="MODE=LIVE but LIVE_CONFIRM != I_UNDERSTAND; running PREFLIGHT")
+    if s.mode == "LIVE" and not s.account_id:
+        jlog("live_account_missing", reason="PUBLIC_ACCOUNT_ID is blank; live entries will be rejected")
     jlog("startup", mode=s.mode, allowlist=sorted(s.allowlist), max_qty=s.max_qty,
          max_premium=s.max_premium, max_orders_per_day=s.max_orders_per_day,
          max_daily_opens=s.max_daily_opens, settings=s.public_view())
@@ -3203,9 +3397,10 @@ def create_app(settings: Optional[Settings] = None,
             jlog("keepalive_failed", error=type(e).__name__)
             return JSONResponse({"ok": False, "error": "store unavailable"}, status_code=503)
         reconciled = None
-        if s.mode == "PAPER" and alpaca is not None:
+        if alpaca is not None and s.mode in ("PAPER", "LIVE"):
+            paper_book = s if s.mode == "PAPER" else replace(s, mode="PAPER")
             try:
-                reconciled = await reconcile_paper_positions(store, alpaca, s, clock().date().isoformat())
+                reconciled = await reconcile_paper_positions(store, alpaca, paper_book, clock().date().isoformat())
             except (StoreError, httpx.HTTPError, Reject) as exc:
                 jlog("paper_reconcile_failed", error=type(exc).__name__)
                 return JSONResponse({"ok": False, "error": "paper reconcile failed"}, status_code=503)
@@ -3317,10 +3512,33 @@ def create_app(settings: Optional[Settings] = None,
                 return respond(503, {"ok": False, "alert_id": alert_id, "error": "Alpaca is not configured"})
             return await run_paper_alert(
                 payload, alert_id, day, now, s, store, client, alpaca, sleep, respond, market_data)
+        if s.mode == "LIVE":
+            try:
+                routed_name = strategy_name(payload)
+            except Reject as exc:
+                await store.finish(alert_id, "REJECTED", mode=s.mode, detail={"reason": exc.reason})
+                return respond(exc.status, error_body(alert_id, exc.reason))
+            if routed_name not in s.live_strategies:
+                # The live switches are on, but this strategy is not on the ceiling.
+                # It keeps the paper book. It does not fall through to a Public.com order.
+                if alpaca is None:
+                    jlog("paper_route_unavailable", strategy=routed_name)
+                    await store.finish(alert_id, "ERROR", mode=s.mode, detail={
+                        "reason": "Alpaca is not configured", "strategy": routed_name})
+                    return respond(503, {"ok": False, "alert_id": alert_id,
+                                         "error": "Alpaca is not configured"})
+                jlog("paper_route", strategy=routed_name, reason="strategy is not live-eligible")
+                return await run_paper_alert(
+                    payload, alert_id, day, now, replace(s, mode="PAPER"), store, client, alpaca,
+                    sleep, respond, market_data)
         releases: list[tuple] = []
         selection: Optional[dict] = None
         try:
             profile = s.for_strategy(strategy_name(payload))
+            if s.mode == "LIVE":
+                if not s.account_id:
+                    raise Reject("PUBLIC_ACCOUNT_ID is required before a live order")
+                profile = live_execution_profile(profile, s)
             order_payload, selection = await prepare_order(payload, profile, client, store, now, market_data)
             if profile.flow_rules and selection is None and str(order_payload.get("open_close", "")).upper() == "OPEN":
                 raise Reject("FlowVWAP entries must use the underlying symbol, not an OCC symbol")
@@ -3356,6 +3574,19 @@ def create_app(settings: Optional[Settings] = None,
             # Underlying alerts already failed closed on the window before any Public call.
             if selection is None and profile.enforce_hours and not in_hours(now):
                 raise Reject(hours_error(now))
+            settled: Optional[Decimal] = None
+            if s.mode == "LIVE":
+                guard_live_order(o, selection)
+                if o["open_close"] == "OPEN":
+                    settled = await client.settled_option_cash()
+                    if settled < o["notional"]:
+                        jlog("live_cash", ok=False, settled=format(settled, "f"),
+                             required=format(o["notional"], "f"))
+                        raise Reject(
+                            f"settled cash {format(settled, 'f')} is below the "
+                            f"{format(o['notional'], 'f')} premium")
+                    jlog("live_cash", ok=True, settled=format(settled, "f"),
+                         required=format(o["notional"], "f"))
             is_open = o["open_close"] == "OPEN"
             is_exit = not is_open
             reason = await store.try_consume(day, profile.mode, o["notional"], is_open, profile, is_exit=is_exit)
@@ -3463,9 +3694,21 @@ def create_app(settings: Optional[Settings] = None,
                 if selection is not None:
                     failed["selection"] = selection
                 return respond(502, failed)
+            if s.mode == "LIVE" and o["open_close"] == "OPEN":
+                requirement = preflight_buying_power(pf_body)
+                if requirement is not None and settled is not None and requirement > settled:
+                    jlog("live_cash", ok=False, settled=format(settled, "f"),
+                         buying_power_requirement=format(requirement, "f"))
+                    await fail("REJECTED", {"reason": "preflight buying power", "preflight": pf_body,
+                                            "selection": selection})
+                    return respond(422, error_body(
+                        alert_id,
+                        f"preflight buying power {format(requirement, 'f')} exceeds settled cash "
+                        f"{format(settled, 'f')}",
+                        selection))
             if s.mode != "LIVE":
                 return await accept(pf_body, False)
-            place_body = {**body, "orderId": str(uuid.uuid4())}
+            place_body = {**body, "orderId": live_order_id(alert_id, o["open_close"])}
             r = await client.place(place_body)
             r_body = _json(r)
             jlog("place_order", status=r.status_code, request=place_body, response=r_body)
@@ -3476,7 +3719,7 @@ def create_app(settings: Optional[Settings] = None,
                 if selection is not None:
                     failed["selection"] = selection
                 return respond(502, failed)
-            return await accept(None, True, orderId=place_body["orderId"], response=r_body)
+            return await accept(None, True, orderId=place_body["orderId"], response=r_body, broker="public")
         except (httpx.HTTPError, RuntimeError, KeyError) as e:
             # Don't release on transport errors during LIVE place: order may have gone through.
             await store.finish(alert_id, "ERROR", mode=s.mode, detail=audit_detail(selection, error=type(e).__name__))

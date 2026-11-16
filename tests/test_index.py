@@ -297,6 +297,12 @@ def make(tmp_path, mode="PREFLIGHT", confirm="", clock=lambda: OPEN_TIME, sb=Non
         env.setdefault("ALPACA_SECRET_KEY", "alpaca-secret")
         alpaca = alpaca if alpaca is not None else FakeAlpaca()
         alpaca_transport = httpx.MockTransport(alpaca)
+    elif alpaca is not None or over.get("ALPACA_KEY_ID"):
+        # LIVE can route non-allowlisted strategies to paper. The transport stays a mock.
+        env.setdefault("ALPACA_KEY_ID", "alpaca-key")
+        env.setdefault("ALPACA_SECRET_KEY", "alpaca-secret")
+        alpaca = alpaca if alpaca is not None else FakeAlpaca()
+        alpaca_transport = httpx.MockTransport(alpaca)
     a = relay.create_app(relay.Settings.from_env(env), transport=httpx.MockTransport(fake),
                          store_transport=httpx.MockTransport(sb), clock=clock,
                          alpaca_transport=alpaca_transport, sleeper=_no_sleep)
@@ -381,19 +387,18 @@ def test_live_without_confirm_stays_preflight(tmp_path):
 
 
 def test_live_mode_calls_order_once(tmp_path):
+    """A strategy outside the live ceiling does not reach Public.com.
+
+    This alert's strategy is "default". With the live switches on and no Alpaca paper
+    keys, the relay fails closed instead of placing the order on the brokerage account.
+    PremarketES is covered in test_live_public.py.
+    """
     c, fake = make(tmp_path, mode="LIVE", confirm="I_UNDERSTAND")
     r = c.post("/webhook", json=alert())
-    assert r.status_code == 200, r.text
-    assert r.json()["order_placed"] is True
-    orders = [x for x in fake.calls if x.url.path.endswith("/order")]
-    assert len(orders) == 1
-    body = json.loads(orders[0].content)
-    assert orders[0].url.path == "/userapigateway/trading/ACC1/order"
-    assert body["instrument"] == {"symbol": "AAPL261120C00250000", "type": "OPTION"}
-    assert body["orderType"] == "LIMIT" and body["limitPrice"] == "1.50" and body["quantity"] == "1"
-    assert body["openCloseIndicator"] == "OPEN" and body["orderId"]
-    # token fetched once and cached
-    assert fake.paths().count(relay.TOKEN_PATH) == 1
+    assert r.status_code == 503, r.text
+    assert r.json()["error"] == "Alpaca is not configured"
+    assert not any(path.endswith("/order") for path in fake.paths())
+    assert not any(path.endswith("/preflight/single-leg") for path in fake.paths())
 
 
 def test_allowlist_and_hours(tmp_path):
@@ -1303,20 +1308,17 @@ def test_take_profit_limit_may_exceed_max_premium(tmp_path):
 
 
 def test_live_open_does_not_place_the_take_profit(tmp_path):
-    c, fake = make(tmp_path, mode="LIVE", confirm="I_UNDERSTAND", MAX_QTY="2")
+    """Non-allowlisted LIVE alerts stay on Alpaca paper and never call Public.com /order."""
+    broker = FakeAlpaca()
+    c, fake = make(tmp_path, mode="LIVE", confirm="I_UNDERSTAND", MAX_QTY="2", alpaca=broker)
     r = c.post("/webhook", json=alert(qty=2, limit_price="1.00"))
     assert r.status_code == 200, r.text
+    assert r.json()["broker"] == "alpaca" and r.json()["mode"] == "PAPER"
     assert r.json()["order_placed"] is True
-    assert r.json()["take_profit"]["attached"] is True
-    orders = ending(fake, "/order")
-    assert len(orders) == 1
-    assert len(ending(fake, "/preflight/single-leg")) == 2
-    entry_id = json.loads(orders[0].content)["orderId"]
-    assert r.json()["orderId"] == entry_id
-    assert r.json()["take_profit"]["orderId"] != entry_id
-    assert "orderId" not in r.json()["take_profit"]["order"]
-    assert "orderId" not in json.loads(ending(fake, "/preflight/single-leg")[1].content)
-    assert r.json()["stop"]["attached"] is False
+    assert ending(fake, "/order") == []
+    assert ending(fake, "/preflight/single-leg") == []
+    assert broker.posts()[0]["position_intent"] == "buy_to_open"
+    assert broker.posts()[0]["qty"] == "2"
 
 
 CLOSE_QUOTE = {CHOSEN_CALL: option_quote(CHOSEN_CALL, "1.10", "1.30")}
@@ -1485,64 +1487,54 @@ def test_partial_take_profit_fill_sells_only_what_remains(tmp_path):
 
 
 def test_live_win_reconciles_the_take_profit_fill_and_places_only_the_sell(tmp_path):
+    """Tape is not live-eligible. A LIVE process flattens it on Alpaca paper, not Public.com."""
     public = StatusPublic(quotes=CLOSE_QUOTE)
-    c, fake = make(tmp_path, mode="LIVE", confirm="I_UNDERSTAND", public=public, MAX_QTY="2",
-                   MAX_DAILY_OPENS="1000", STOP_LOSS_PERCENT="30")
+    broker = FakeAlpaca()
+    c, fake = make(tmp_path, mode="LIVE", confirm="I_UNDERSTAND", public=public, alpaca=broker,
+                   MAX_QTY="2", MAX_DAILY_OPENS="1000", STOP_LOSS_PERCENT="30")
     opened = c.post("/webhook", json=underlying(qty=2, alert_id="live-win"))
     assert opened.status_code == 200, opened.text
-    assert opened.json()["order_placed"] is True
-    assert opened.json()["stop"]["attached"] is True and opened.json()["stop"]["stop_price"] == "1.02"
-    assert len(ending(fake, "/order")) == 1
-    assert len(ending(fake, "/preflight/single-leg")) == 3
-    pos = saved_position(c, "LIVE")
-    public.statuses[pos["tp_order_id"]] = {"status": "FILLED", "filledQuantity": "1"}
-    public.statuses[pos["stop_order_id"]] = {"status": "NEW", "filledQuantity": "0"}
+    assert opened.json()["broker"] == "alpaca" and opened.json()["mode"] == "PAPER"
+    assert ending(fake, "/order") == []
+    assert saved_position(c, "PAPER")["status"] == "OPEN"
     flat = c.post("/webhook", json=flatten_alert("live-flat-win"))
     assert flat.status_code == 200, flat.text
-    closed = flat.json()
-    assert closed["order_placed"] is True and closed["contracts_closed"] == 1
-    assert closed["runners_closed"] == 1 and closed["order"]["quantity"] == "1"
-    assert "cancel_take_profit" not in closed
-    assert closed["cancel_stop"]["working_quantity"] == 1 and closed["cancel_stop"]["quantity"] == 2
-    places = ending(fake, "/order")
-    assert len(places) == 2
-    assert [json.loads(call.content)["orderType"] for call in places] == ["LIMIT", "LIMIT"]
-    assert json.loads(places[1].content)["quantity"] == "1"
-    looked_up = {call.url.path.rsplit("/", 1)[-1] for call in fake.calls
-                 if call.method == "GET" and "/order/" in call.url.path}
-    assert looked_up == {pos["tp_order_id"], pos["stop_order_id"]}
-    saved = saved_position(c, "LIVE")
-    assert saved["tp_status"] == "FILLED" and saved["tp_filled"] == 1 and saved["stop_status"] == "CANCELLED"
-    assert c.sb.counters[("2026-10-19", "LIVE")][0] == 1
-    assert c.sb.exit_orders[("2026-10-19", "LIVE")] == 3
+    assert flat.json()["broker"] == "alpaca"
+    flatten = [order for order in broker.posts()
+               if order["side"] == "sell" and order["type"] == "limit" and order["position_intent"] == "sell_to_close"
+               and order["qty"] == "2"]
+    assert len(flatten) == 1
+    assert ending(fake, "/order") == []
+    assert saved_position(c, "PAPER")["status"] == "CLOSED"
+    assert ("SPY", "Tape", "LIVE") not in c.sb.positions
 
 
 def test_live_missing_exit_order_sells_the_stored_open_quantity(tmp_path):
     public = StatusPublic(quotes=CLOSE_QUOTE)
-    c, fake = make(tmp_path, mode="LIVE", confirm="I_UNDERSTAND", public=public, MAX_QTY="2",
-                   MAX_DAILY_OPENS="1000", STOP_LOSS_PERCENT="30")
+    broker = FakeAlpaca()
+    c, fake = make(tmp_path, mode="LIVE", confirm="I_UNDERSTAND", public=public, alpaca=broker,
+                   MAX_QTY="2", MAX_DAILY_OPENS="1000", STOP_LOSS_PERCENT="30")
     assert c.post("/webhook", json=underlying(qty=2, alert_id="live-miss")).status_code == 200
     flat = c.post("/webhook", json=flatten_alert("live-flat-miss"))
     assert flat.status_code == 200, flat.text
-    closed = flat.json()
-    assert closed["contracts_closed"] == 2 and closed["order"]["quantity"] == "2" and closed["order_placed"] is True
-    assert closed["cancel_take_profit"]["quantity"] == 1 and closed["cancel_stop"]["quantity"] == 2
-    assert len(ending(fake, "/order")) == 2
-    assert len([call for call in fake.calls if call.method == "GET" and "/order/" in call.url.path]) == 2
-    saved = saved_position(c, "LIVE")
-    assert saved["status"] == "CLOSED" and saved["tp_filled"] == 0 and saved["tp_status"] == "CANCELLED"
+    assert flat.json()["broker"] == "alpaca" and flat.json()["order_placed"] is True
+    assert ending(fake, "/order") == []
+    assert not any(call.method == "GET" and "/order/" in call.url.path for call in fake.calls)
+    assert saved_position(c, "PAPER")["status"] == "CLOSED"
 
 
 def test_live_order_status_failure_leaves_the_position_open(tmp_path):
-    public = StatusPublic(order_status=500)
-    c, fake = make(tmp_path, mode="LIVE", confirm="I_UNDERSTAND", public=public, MAX_QTY="2",
-                   MAX_DAILY_OPENS="1000", STOP_LOSS_PERCENT="30")
+    """Public.com order-status errors are not consulted for a strategy that stays on paper."""
+    public = StatusPublic(order_status=500, quotes=CLOSE_QUOTE)
+    broker = FakeAlpaca()
+    c, fake = make(tmp_path, mode="LIVE", confirm="I_UNDERSTAND", public=public, alpaca=broker,
+                   MAX_QTY="2", MAX_DAILY_OPENS="1000", STOP_LOSS_PERCENT="30")
     assert c.post("/webhook", json=underlying(qty=2, alert_id="live-down")).status_code == 200
     flat = c.post("/webhook", json=flatten_alert("live-flat-down"))
-    assert flat.status_code == 502, flat.text
-    assert "order status failed" in flat.json()["error"]
-    assert saved_position(c, "LIVE")["status"] == "OPEN"
-    assert len(ending(fake, "/order")) == 1
+    assert flat.status_code == 200, flat.text
+    assert flat.json()["broker"] == "alpaca"
+    assert ending(fake, "/order") == []
+    assert saved_position(c, "PAPER")["status"] == "CLOSED"
 
 
 def test_alpaca_symbol_tick_and_zero_dte_cutoff():
