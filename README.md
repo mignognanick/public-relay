@@ -1,4 +1,6 @@
 # public-relay on Vercel + Supabase (port, not deployed)
+
+Quant Engine V1 work lives on `dev/quant-engine`. Start with `AGENTS.md`. The standalone risk engine is `quant_engine/risk/` (`docs/RISK_ENGINE.md`); it is not called by the relay yet. Known relay weaknesses are in `docs/ARCHITECTURE.md`.
 - `api/index.py` FastAPI app (all routes rewritten to it by `vercel.json`; region iad1, maxDuration 30s).
 - State in Supabase. Apply the migrations in order before deploying this version:
   `0001_relay_state.sql` (processed_alerts, daily_counters), `0002_positions_and_picks.sql`
