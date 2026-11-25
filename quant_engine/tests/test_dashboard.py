@@ -34,7 +34,7 @@ def new_strategy():
 
 
 def test_auth_and_fail_closed(client, store):
-    for path in ['/api/state', '/api/history']:
+    for path in ['/api/state', '/api/history', '/api/accounts']:
         assert client.get(path).status_code == 401
         assert client.get(path, headers={'Authorization': 'Bearer incorrect'}).status_code == 401
     assert client.post('/api/commands', json={}).status_code == 401

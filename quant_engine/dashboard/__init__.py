@@ -1,1 +1,1 @@
-"""Isolated paper-only Quant Engine control plane; no broker clients."""
+"""Isolated paper-only Quant Engine control plane; brokers are read-only snapshots."""

@@ -11,3 +11,8 @@ var/
 node_modules
 supabase/.temp/
 .env.quant*
+
+# Local review artifacts and dashboard secrets
+.local-token
+.supabase-dev-*
+qe-control.png
