@@ -32,7 +32,7 @@ Open **http://127.0.0.1:8765** and enter that same token. Use a fresh local-only
 
 ## Working features
 
-- Seven responsive sections: Overview, Day Trading, Swing Trading, Long-Term Investing, Strategy Lab, Control Center, Tax Center.
+- Seven responsive sections: Overview, Day Trading, Swing Trading, Long-Term Investing, Strategy Lab, Control Center, Tax Center. Overview includes a read-only Accounts panel.
 - Authenticated reads and commands; local token mode or Supabase registered-user auth. No public configuration data; the unauthenticated page is just a sign-in shell.
 - Shared registry of three independently controlled portfolios and user-created strategies. Empty registry initially: existing relay strategies are not silently imported or approved.
 - Append-only configuration snapshots, actor, database timestamp and reason. Optimistic concurrency rejects stale saves with HTTP 409; refresh and review before retrying. Latest 50 versions displayed; all remain stored.
@@ -44,7 +44,7 @@ Open **http://127.0.0.1:8765** and enter that same token. Use a fresh local-only
 
 ## Explicitly not implemented
 
-No broker data, balances, holdings, performance, orders, paper execution worker, live trading, worker acknowledgements, market feed, classifier, automated backtest runner, AI research jobs, specific-lot optimization, wash-sale engine, state-tax calculator or sale recommendations. No synthetic trading returns are displayed. All tax inputs beyond the unverified starting estimate are user-entered hypothetical scenarios.
+Read-only Alpaca paper and Public.com snapshots can appear on Overview → Accounts when dashboard-only credentials are set (`ALPACA_PAPER_KEY_ID`, `ALPACA_PAPER_SECRET_KEY`, `PUBLIC_READONLY_SECRET`, `PUBLIC_ACCOUNT_ID`). Missing keys show “not connected”. The code has no order-submission or cancel paths; Alpaca is pinned to `https://paper-api.alpaca.markets`. These views do not change saved configuration or authorize trading. Still not implemented: paper execution worker, live trading, worker acknowledgements, market feed, classifier, automated backtest runner, AI research jobs, specific-lot optimization, wash-sale engine, state-tax calculator or sale recommendations. No synthetic trading returns are displayed. All tax inputs beyond the unverified starting estimate are user-entered hypothetical scenarios.
 
 The existing risk engine remains independent and unchanged. This dashboard does not yet call it for orders. A future worker must validate configuration and research evidence independently, fetch fresh broker data, obtain atomic risk approval, keep protective exits independent of entry restrictions, and acknowledge the precise saved version. `worker_acknowledged_version` is always null and `execution_active` is always false. Do not wire a broker to this control plane as-is.
 
@@ -75,6 +75,15 @@ SQLite is single-host local development only. Supabase is the serverless persist
 Nothing was deployed and no Vercel settings were changed. Do not change the existing project's entrypoint to test this UI. The current root `app.py` still loads the production relay.
 
 For a later isolated development preview, prepare a separate Vercel project or deployment directory whose `app.py` exports `quant_engine.dashboard.app.app`, copies `quant_engine/` including static assets, and includes `requirements.txt`. Use the FastAPI framework, **no relay cron**, only the three `QE_*` Supabase settings above, and a non-production Supabase database. Local auth/storage deliberately refuses to start when `VERCEL` is set. This preview setup has not been deployed or verified; production activation is outside this milestone.
+
+## Read-only broker views
+
+Do not source the relay `.env`. Use these dashboard-only names:
+
+- `ALPACA_PAPER_KEY_ID` and `ALPACA_PAPER_SECRET_KEY` from an Alpaca **paper** account at [Alpaca paper API keys](https://app.alpaca.markets/paper/dashboard/overview) → API Keys. Do not use a live trading key.
+- `PUBLIC_READONLY_SECRET` from Public.com [Account Settings → Security → API](https://public.com/settings). `PUBLIC_ACCOUNT_ID` is the brokerage account id shown in that API (or returned by `GET /userapigateway/trading/account` after exchanging the secret for an access token).
+
+The dashboard exchanges the Public secret for a short-lived access token, then only GETs the official portfolio snapshot. It never places or cancels orders. `execution_active` remains false.
 
 ## Verification
 

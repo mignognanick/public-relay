@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
 from quant_engine.dashboard.domain import Command, transition, view
+from quant_engine.brokers.readonly import accounts_snapshot
 from quant_engine.dashboard.store import Conflict, SQLiteStore, SupabaseStore, Unavailable
 
 STATIC = Path(__file__).parent / 'static'
@@ -23,8 +24,8 @@ class Login(BaseModel):
     password: str = Field(min_length=1, max_length=1024)
 
 
-def create_app(store=None, env=None, client=None):
-    keys = ('QE_AUTH_MODE', 'QE_LOCAL_TOKEN', 'QE_SUPABASE_URL', 'QE_SUPABASE_PUBLISHABLE_KEY', 'QE_SQLITE_PATH', 'VERCEL')
+def create_app(store=None, env=None, client=None, brokers_client=None):
+    keys = ('QE_AUTH_MODE', 'QE_LOCAL_TOKEN', 'QE_SUPABASE_URL', 'QE_SUPABASE_PUBLISHABLE_KEY', 'QE_SQLITE_PATH', 'VERCEL', 'ALPACA_PAPER_KEY_ID', 'ALPACA_PAPER_SECRET_KEY', 'PUBLIC_READONLY_SECRET', 'PUBLIC_ACCOUNT_ID')
     config = {key: os.environ[key] for key in keys if key in os.environ} if env is None else dict(env)
     auth_mode = config.get('QE_AUTH_MODE', 'local')
     token = config.get('QE_LOCAL_TOKEN', '')
@@ -119,6 +120,13 @@ def create_app(store=None, env=None, client=None):
     @app.get('/api/history')
     def history(who=Depends(identity)):
         return database.history(*who)
+
+    @app.get('/api/accounts')
+    def accounts(who=Depends(identity)):
+        # Read-only snapshots. Missing keys are "not connected"; never fail the page.
+        snapshot = accounts_snapshot(config, client=brokers_client)
+        snapshot['execution_active'] = False
+        return snapshot
 
     @app.post('/api/commands')
     def command(body: Command, who=Depends(identity)):

@@ -2,7 +2,8 @@
 let accessToken = "",
   data = null,
   page = "overview",
-  history = [];
+  history = [],
+  accounts = { execution_active: false, accounts: [] };
 const sections = {
   overview: "Overview",
   day: "Day Trading",
@@ -40,6 +41,10 @@ const escapeHTML = (value) =>
 const pretty = (value) => String(value).replaceAll("_", " ");
 const money = (value) =>
   Number(value).toLocaleString("en-US", { style: "currency", currency: "USD" });
+const safeMoney = (value) =>
+  value == null || value === "" || Number.isNaN(Number(value))
+    ? "—"
+    : money(value);
 const options = (values, selected) =>
   values
     .map(
@@ -82,6 +87,35 @@ async function refresh() {
   const log = await api("/api/history");
   data = next;
   history = log;
+  try {
+    accounts = await api("/api/accounts");
+  } catch {
+    accounts = {
+      execution_active: false,
+      accounts: [
+        {
+          id: "alpaca_paper",
+          name: "Alpaca Paper",
+          connected: false,
+          status: "not connected",
+          message: "not connected",
+          balances: null,
+          positions: [],
+          orders: [],
+        },
+        {
+          id: "public",
+          name: "Public.com",
+          connected: false,
+          status: "not connected",
+          message: "not connected",
+          balances: null,
+          positions: [],
+          orders: [],
+        },
+      ],
+    };
+  }
   render();
 }
 async function change(action, target, values, why) {
@@ -108,6 +142,7 @@ function signOut() {
   accessToken = "";
   data = null;
   history = [];
+  accounts = { execution_active: false, accounts: [] };
   $("content").replaceChildren();
   $("workspace").hidden = true;
   $("login").hidden = false;
@@ -123,8 +158,53 @@ function registry(filter) {
     return '<div class="empty"><h3>Your registry starts here</h3><p>Add a research idea in Strategy Lab. Existing relay strategies have not been imported or approved automatically.</p></div>';
   return `<div class="table-wrap"><table><thead><tr><th>Strategy</th><th>Portfolio</th><th>Stage</th><th>Entry review</th></tr></thead><tbody>${rows.map((s) => `<tr><td>${escapeHTML(s.name)}<br><small>Switch ${s.enabled ? "on" : "off"}</small></td><td>${sections[s.portfolio]}</td><td>${s.stage}</td><td>${data.eligibility[s.id].eligible_for_risk_review ? "Eligible for independent risk review" : escapeHTML(data.eligibility[s.id].reasons.join(" · "))}<br><small>No execution worker</small></td></tr>`).join("")}</tbody></table></div>`;
 }
+function accountCard(account) {
+  const connected = account && account.connected;
+  const balances = (account && account.balances) || {};
+  const positions = (account && account.positions) || [];
+  const orders = (account && account.orders) || [];
+  const status = escapeHTML((account && (account.message || account.status)) || "not connected");
+  const rows = positions.length
+    ? positions
+        .map(
+          (row) =>
+            `<tr><td>${escapeHTML(row.symbol || "—")}</td><td>${escapeHTML(row.qty || "—")}</td><td>${safeMoney(row.market_value)}</td><td>${row.unrealized_pl != null && row.unrealized_pl !== "" ? safeMoney(row.unrealized_pl) : "—"}</td></tr>`,
+        )
+        .join("")
+    : '<tr><td colspan="4">No positions</td></tr>';
+  const orderRows = orders.length
+    ? orders
+        .slice(0, 20)
+        .map(
+          (row) =>
+            `<tr><td>${escapeHTML(row.submitted_at ? new Date(row.submitted_at).toLocaleString() : "—")}</td><td>${escapeHTML(row.symbol || "—")}</td><td>${escapeHTML([row.side, row.qty, row.type].filter(Boolean).join(" "))}</td><td>${escapeHTML(row.status || "—")}</td></tr>`,
+        )
+        .join("")
+    : "";
+  const orderTable =
+    account && account.id === "alpaca_paper"
+      ? `<div class="table-wrap"><table><thead><tr><th>When</th><th>Symbol</th><th>Order</th><th>Status</th></tr></thead><tbody>${orderRows || '<tr><td colspan="4">No recent orders</td></tr>'}</tbody></table></div>`
+      : "";
+  return `<div class="card"><div class="row"><h2>${escapeHTML((account && account.name) || "Account")}</h2><span class="badge">${connected ? "Connected · read only" : "Not connected"}</span></div><p><small>${status}. This dashboard cannot place or cancel orders.</small></p>${
+    connected
+      ? `<div class="row"><span>Equity</span><strong>${safeMoney(balances.equity)}</strong></div><div class="row"><span>Cash</span><strong>${safeMoney(balances.cash)}</strong></div><div class="row"><span>Buying power</span><strong>${safeMoney(balances.buying_power)}</strong></div><div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Qty</th><th>Market value</th><th>Unrealized P/L</th></tr></thead><tbody>${rows}</tbody></table></div>${orderTable}`
+      : "<p>Connect this account by adding its read-only credentials to the dashboard environment.</p>"
+  }</div>`;
+}
+function accountsPanel() {
+  const list = (accounts && accounts.accounts) || [];
+  const cards = list.length
+    ? list.map(accountCard).join("")
+    : accountCard({
+        name: "Accounts",
+        connected: false,
+        status: "not connected",
+        message: "not connected",
+      });
+  return `<div class="card"><div class="row"><h2>Accounts</h2><span class="badge">READ ONLY</span></div><p>Alpaca paper and Public.com balances and positions. Execution stays disconnected; these views never submit or cancel orders.</p><div class="grid two">${cards}</div></div>`;
+}
 function overview() {
-  return `<div class="grid">${metric("Execution", "Disconnected", "Paper-only · no orders can be sent")}${metric("Research registry", data.state.strategies.length, "User-entered research, not trading results")}${metric("New entries", data.state.paused ? "Paused" : "Requested on", "Saved preference · not applied to relay")}</div><div class="grid">${data.state.portfolios.map((p) => `<div class="card"><span class="eyebrow">PORTFOLIO</span><h2>${p.name}</h2><p>${pretty(p.mode)} · ${pretty(p.regime)}</p><div class="rule"></div><div class="row"><span>Account equity</span><strong>Not connected</strong></div><p><small>No positions or performance imported.</small></p><button class="secondary" data-page="${p.id}">Open portfolio →</button></div>`).join("")}</div><div class="card"><div class="row"><h2>Strategy registry</h2><span class="badge">Shared workspace</span></div>${registry()}</div>`;
+  return `<div class="grid">${metric("Execution", "Disconnected", "Paper-only · no orders can be sent")}${metric("Research registry", data.state.strategies.length, "User-entered research, not trading results")}${metric("New entries", data.state.paused ? "Paused" : "Requested on", "Saved preference · not applied to relay")}</div>${accountsPanel()}<div class="grid">${data.state.portfolios.map((p) => `<div class="card"><span class="eyebrow">PORTFOLIO</span><h2>${p.name}</h2><p>${pretty(p.mode)} · ${pretty(p.regime)}</p><div class="rule"></div><div class="row"><span>Account equity</span><strong>Not connected</strong></div><p><small>Portfolio controls are not linked to a broker.</small></p><button class="secondary" data-page="${p.id}">Open portfolio →</button></div>`).join("")}</div><div class="card"><div class="row"><h2>Strategy registry</h2><span class="badge">Shared workspace</span></div>${registry()}</div>`;
 }
 function portfolio(id) {
   const p = data.state.portfolios.find((x) => x.id === id);
