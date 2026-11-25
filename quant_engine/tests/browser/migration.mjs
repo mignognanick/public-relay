@@ -63,6 +63,64 @@ await assert.rejects(
   () => db.exec("select * from qe_versions"),
   /permission denied/i,
 );
+await db.exec("reset role; set request.jwt.claims='{}';");
+await db.exec(
+  readFileSync(
+    "supabase/migrations/20261125184016_quant_backtesting_records.sql",
+    "utf8",
+  ),
+);
+await db.exec(`set role authenticated; set request.jwt.claim.sub='${owner}';`);
+async function researchInsert(actor = owner, kind = "trial", id = "test") {
+  return db.query(
+    "insert into qe_research_records(owner,kind,id,payload) values ($1,$2,$3,$4)",
+    [actor, kind, id, JSON.stringify({ test: true })],
+  );
+}
+await researchInsert();
+assert.equal(
+  (await db.query("select * from qe_research_records")).rows.length,
+  1,
+);
+await assert.rejects(() => researchInsert(), /duplicate/i);
+await assert.rejects(
+  () => researchInsert(owner, "invalid", "bad"),
+  /check constraint/i,
+);
+await assert.rejects(
+  () => researchInsert("00000000-0000-0000-0000-000000000002"),
+  /row-level security/i,
+);
+await assert.rejects(
+  () => db.exec("update qe_research_records set payload='{}'"),
+  /permission denied/i,
+);
+await assert.rejects(
+  () => db.exec("delete from qe_research_records"),
+  /permission denied/i,
+);
+await db.exec(
+  "set request.jwt.claim.sub='00000000-0000-0000-0000-000000000002'",
+);
+assert.equal(
+  (await db.query("select * from qe_research_records")).rows.length,
+  0,
+);
+await db.exec(
+  `set request.jwt.claim.sub='${owner}'; set request.jwt.claims='{"is_anonymous":true}';`,
+);
+await assert.rejects(
+  () => researchInsert(owner, "result", "anonymous"),
+  /row-level security/i,
+);
+await db.exec("reset role; set role anon");
+await assert.rejects(
+  () => db.exec("select * from qe_research_records"),
+  /permission denied/i,
+);
+console.log(
+  "Research migration: ownership, immutable records, duplicate rejection, kind validation and anonymous denial passed.",
+);
 await db.close();
 console.log(
   "Migration: ownership, RLS, append-only audit, version conflicts, anonymous denial and PAPER constraint passed.",

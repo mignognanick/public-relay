@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
+from quant_engine.backtesting.api import router as research_router
 from quant_engine.dashboard.domain import Command, transition, view
 from quant_engine.brokers.readonly import accounts_snapshot
 from quant_engine.dashboard.store import Conflict, SQLiteStore, SupabaseStore, Unavailable
@@ -24,7 +25,7 @@ class Login(BaseModel):
     password: str = Field(min_length=1, max_length=1024)
 
 
-def create_app(store=None, env=None, client=None, brokers_client=None):
+def create_app(store=None, env=None, client=None, brokers_client=None, history_client=None):
     keys = ('QE_AUTH_MODE', 'QE_LOCAL_TOKEN', 'QE_SUPABASE_URL', 'QE_SUPABASE_PUBLISHABLE_KEY', 'QE_SQLITE_PATH', 'VERCEL', 'ALPACA_PAPER_KEY_ID', 'ALPACA_PAPER_SECRET_KEY', 'PUBLIC_READONLY_SECRET', 'PUBLIC_ACCOUNT_ID')
     config = {key: os.environ[key] for key in keys if key in os.environ} if env is None else dict(env)
     auth_mode = config.get('QE_AUTH_MODE', 'local')
@@ -142,6 +143,8 @@ def create_app(store=None, env=None, client=None, brokers_client=None):
             raise HTTPException(422, str(exc)) from None
         version = database.save(*who, version, updated, body.action + ': ' + body.reason)
         return view(updated, version)
+
+    app.include_router(research_router(database, identity, config, history_client))
 
     app.mount('/static', StaticFiles(directory=STATIC), name='static')
     return app
