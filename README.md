@@ -374,3 +374,9 @@ How the research was done (`research/`, stdlib Python only):
 - Bands below 0.50 delta need OTM strikes. The research grid simulated those with a 5-point OTM window. `PremarketES` is the relay profile that trades that window (delta 0.35–0.40, ATM through 5 points OTM). FlowVWAP and `QQQ_EMA_VWAP` still pick ATM through ITM.
 
 Those selection and exit values are the checked-in `QQQ_EMA_VWAP` profile. Do not copy them onto FlowVWAP or onto the global env. `QQQ` is already on the allowlist. Leave `MODE`, `LIVE_CONFIRM`, and the production `MAX_DAILY_OPENS=1000` as they are.
+
+## Quant Engine development dashboard
+
+An isolated, authenticated paper-only dashboard is available at
+`quant_engine.dashboard.app:app`. It does not alter or control the existing relay.
+See [setup, implemented features, tests and limitations](docs/DASHBOARD.md).

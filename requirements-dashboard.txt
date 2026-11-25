@@ -1,0 +1,3 @@
+-r requirements.txt
+# Local ASGI server; no additional application runtime dependency.
+uvicorn==0.54.0
