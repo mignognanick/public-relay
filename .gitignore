@@ -6,3 +6,13 @@ __pycache__/
 research/data/
 research/results/stage*.json
 var/
+
+# Local dashboard verification dependencies and Supabase CLI cache
+node_modules
+supabase/.temp/
+.env.quant*
+
+# Local review artifacts and dashboard secrets
+.local-token
+.supabase-dev-*
+qe-control.png
