@@ -10,6 +10,10 @@
 * {
   box-sizing: border-box;
 }
+html {
+  overflow-x: hidden;
+  -webkit-text-size-adjust: 100%;
+}
 body {
   margin: 0;
   background: var(--bg);
@@ -18,6 +22,18 @@ body {
     15px/1.55 system-ui,
     -apple-system,
     sans-serif;
+  padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+    env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
+}
+#workspace,
+main,
+.card,
+.row,
+header,
+.grid,
+form {
+  min-width: 0;
+  max-width: 100%;
 }
 button,
 input,
@@ -32,6 +48,7 @@ button {
   color: #192113;
   border-radius: 7px;
   padding: 10px 16px;
+  min-height: 44px;
   font-weight: 650;
 }
 button:hover {
@@ -51,17 +68,33 @@ select,
 textarea {
   display: block;
   width: 100%;
+  max-width: 100%;
   background: #111719;
   color: var(--text);
   border: 1px solid #485457;
   border-radius: 6px;
   padding: 10px;
   margin: 6px 0 15px;
+  font-size: 16px;
+  min-height: 44px;
 }
 input[type="checkbox"] {
   display: inline-block;
-  width: auto;
+  width: 22px;
+  height: 22px;
+  min-height: 22px;
   margin: 0 8px 0 0;
+  flex: 0 0 auto;
+  accent-color: var(--accent);
+}
+label:has(> input[type="checkbox"]) {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-height: 44px;
+  padding: 8px 0 16px;
+  color: var(--text);
+  font-size: 15px;
 }
 textarea {
   min-height: 88px;
@@ -218,8 +251,15 @@ header {
 .row {
   display: flex;
   justify-content: space-between;
-  gap: 20px;
+  flex-wrap: wrap;
+  gap: 12px 20px;
   align-items: center;
+}
+.row h1,
+.row h2 {
+  min-width: 0;
+  flex: 1 1 12rem;
+  overflow-wrap: anywhere;
 }
 .rule {
   border-top: 1px solid var(--border);
@@ -234,12 +274,19 @@ header {
   margin: 12px auto;
 }
 .table-wrap {
-  overflow: auto;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  max-width: 100%;
 }
 table {
   width: 100%;
   border-collapse: collapse;
   font-size: 13px;
+}
+.table-wrap table {
+  min-width: 36rem;
+  width: max-content;
 }
 th,
 td {
@@ -307,10 +354,15 @@ details summary {
   cursor: pointer;
   color: var(--muted);
   margin: 15px 0;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
 }
 pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  overflow-x: auto;
+  max-width: 100%;
   font-size: 11px;
 }
 button:focus-visible,
@@ -340,41 +392,86 @@ a:focus-visible {
   aside {
     position: static;
     width: auto;
-    padding: 20px;
+    padding: 16px 16px 12px;
   }
   .brand {
-    margin-bottom: 15px;
+    margin-bottom: 10px;
   }
   nav {
     display: flex;
-    overflow: auto;
+    flex-wrap: nowrap;
+    gap: 6px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    margin: 0 -8px;
+    padding: 0 8px 8px;
   }
   nav button {
+    flex: 0 0 auto;
     white-space: nowrap;
+    min-height: 44px;
+    min-width: 44px;
+    padding: 10px 14px;
   }
   .sidebar-bottom {
-    display: none;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    margin-top: 4px;
+    padding-top: 10px;
+  }
+  .sidebar-bottom p {
+    margin: 0;
+    font-size: 12px;
   }
   main {
     margin: 0;
-    padding: 22px 16px;
+    padding: 16px;
   }
   header {
-    align-items: start;
-    gap: 10px;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+    margin-bottom: 18px;
   }
   h1 {
-    font-size: 29px;
+    font-size: 26px;
+    letter-spacing: -0.8px;
+    margin: 6px 0 0;
   }
   .header-actions {
-    flex-direction: column;
-    align-items: end;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 8px;
+  }
+  .header-actions button {
+    flex: 1 1 auto;
+  }
+  .card {
+    padding: 16px;
+  }
+  .metric {
+    font-size: 26px;
   }
   .login-card {
-    margin: 8vh 15px;
-    padding: 25px;
+    margin: 8vh 16px;
+    padding: 24px;
   }
-  .row {
-    flex-wrap: wrap;
+  form button,
+  .card > button,
+  .card form button {
+    width: 100%;
+  }
+  .row .badge,
+  .header-actions .badge {
+    flex: 0 0 auto;
+  }
+  th,
+  td {
+    padding: 12px 10px;
+    white-space: nowrap;
   }
 }
