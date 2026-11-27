@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
 from quant_engine.backtesting.api import router as research_router
+from quant_engine.dashboard.alpha_api import router as alpha_router
 from quant_engine.dashboard.domain import Command, transition, view
 from quant_engine.brokers.readonly import accounts_snapshot
 from quant_engine.dashboard.store import Conflict, SQLiteStore, SupabaseStore, Unavailable
@@ -145,6 +146,7 @@ def create_app(store=None, env=None, client=None, brokers_client=None, history_c
         return view(updated, version)
 
     app.include_router(research_router(database, identity, config, history_client))
+    app.include_router(alpha_router(database, identity))
 
     app.mount('/static', StaticFiles(directory=STATIC), name='static')
     return app
