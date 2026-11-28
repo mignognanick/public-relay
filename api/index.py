@@ -19,6 +19,10 @@ for MU, with a wider OTM window aimed at delta 0.125-0.15. Daily order and spend
 on the paper and preflight books. The live book has its own caps and is only PremarketES.
 Selection stays on Public.com. PAPER then checks the OCC symbol at Alpaca and places the entry,
 take-profit, and optional stop there. A live PremarketES entry is a DAY limit after preflight.
+
+WEBHOOK_ASYNC defaults off. While it is off, /webhook behaves as before and the live
+book is unchanged. Nick turns it on only after applying migration 0007. Then /webhook
+stores the alert and returns, and the order runs from that job.
 """
 from __future__ import annotations
 
@@ -39,7 +43,7 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from api import flowvwap
@@ -75,6 +79,9 @@ LIVE_MAX_PREMIUM_CEILING = Decimal("2.50")
 # 1 contract at the premium ceiling. A ~$500 cash account keeps the rest in reserve, and
 # option premium settles the next session, so one entry is the whole live day.
 LIVE_MAX_DAILY_OPENS_CEILING = Decimal("250.00")
+# One drain pass. A killed pass leaves the row pending for the next drain.
+JOB_CLAIM_LIMIT = 8
+JOB_DRAIN_ROUNDS = 4
 # Defaults. Each one is overridable from the environment; see Settings.from_env.
 ITM_POINTS = Decimal("5")
 DELTA_LO = Decimal("0.50")
@@ -440,6 +447,8 @@ class Settings:
     live_max_premium: Decimal = LIVE_MAX_PREMIUM_CEILING
     live_max_daily_opens: Decimal = LIVE_MAX_DAILY_OPENS_CEILING
     close_limit_at_bid: bool = False
+    # Off until migration 0007 is applied. On: /webhook acks after the insert.
+    webhook_async: bool = False
 
     def overridable_view(self) -> dict[str, Any]:
         """Effective selection and exit fields a strategy profile can replace. No secrets."""
@@ -509,6 +518,7 @@ class Settings:
             "live_max_premium": format(self.live_max_premium, "f"),
             "live_max_daily_opens": format(self.live_max_daily_opens, "f"),
             "live_account_configured": bool(self.account_id),
+            "webhook_async": self.webhook_async,
         }
 
     def _validate_strategy_profiles(self) -> None:
@@ -600,6 +610,7 @@ class Settings:
                 e, "LIVE_MAX_ORDERS_PER_DAY", LIVE_MAX_ORDERS_CEILING, 1, LIVE_MAX_ORDERS_CEILING),
             live_max_premium=_live_premium(e),
             live_max_daily_opens=_live_daily_opens(e),
+            webhook_async=_env_bool(e, "WEBHOOK_ASYNC", False),
         )
         settings._validate_strategy_profiles()
         return settings
@@ -620,6 +631,11 @@ if not log.handlers:
     _h.setFormatter(logging.Formatter("%(message)s"))
     log.addHandler(_h)
     log.setLevel(logging.INFO)
+
+
+def job_payload(payload: dict) -> dict:
+    """Alert stored on relay_jobs. Secrets never go in the row."""
+    return {key: value for key, value in payload.items() if str(key).lower() not in REDACT_KEYS}
 
 
 def jlog(event: str, **kw: Any) -> None:
@@ -814,6 +830,28 @@ class Store:
                 jlog("store_finish_failed", alert_id=alert_id, status=r.status_code)
         except httpx.HTTPError as e:  # audit write only; never flip an already-decided outcome
             jlog("store_finish_failed", alert_id=alert_id, error=type(e).__name__)
+
+    async def enqueue_job(self, alert_id: str, day: str, payload: dict) -> str:
+        data = await self._rpc("relay_enqueue_job", {
+            "p_alert_id": alert_id, "p_day": day, "p_payload": payload})
+        if data not in ("queued", "duplicate"):
+            raise StoreError("relay_enqueue_job returned an unexpected result")
+        return str(data)
+
+    async def claim_jobs(self, limit: int) -> list[dict]:
+        data = await self._rpc("relay_claim_jobs", {"p_limit": limit})
+        if data is None:
+            return []
+        if isinstance(data, dict):
+            return [data]
+        if isinstance(data, list):
+            return [row for row in data if isinstance(row, dict)]
+        raise StoreError("relay_claim_jobs returned an unexpected result")
+
+    async def finish_job(self, job_id: int, status: str, http_status: int, result: Any) -> None:
+        await self._rpc("relay_finish_job", {
+            "p_id": job_id, "p_status": status, "p_http_status": http_status,
+            "p_result": json.loads(json.dumps(redact(result), default=str))})
 
 
 # --------------------------------------------------------------------------- Public client
@@ -3388,7 +3426,8 @@ def create_app(settings: Optional[Settings] = None,
 
     @app.get("/keepalive")
     async def keepalive(request: Request):
-        # Vercel Cron sends "Authorization: Bearer $CRON_SECRET". Touches Supabase only, never Public.
+        # Vercel Cron sends "Authorization: Bearer $CRON_SECRET". The ping touches Supabase only.
+        # With WEBHOOK_ASYNC on, the drain below can place an order that was only queued.
         if not cron_authorized(request):
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
         try:
@@ -3396,6 +3435,13 @@ def create_app(settings: Optional[Settings] = None,
         except (StoreError, httpx.HTTPError) as e:
             jlog("keepalive_failed", error=type(e).__name__)
             return JSONResponse({"ok": False, "error": "store unavailable"}, status_code=503)
+        drained = None
+        if s.webhook_async:
+            try:
+                drained = await drain_jobs()
+            except (StoreError, httpx.HTTPError) as e:
+                jlog("job_drain_failed", error=type(e).__name__)
+                return JSONResponse({"ok": False, "error": "job drain failed"}, status_code=503)
         reconciled = None
         if alpaca is not None and s.mode in ("PAPER", "LIVE"):
             paper_book = s if s.mode == "PAPER" else replace(s, mode="PAPER")
@@ -3405,7 +3451,9 @@ def create_app(settings: Optional[Settings] = None,
                 jlog("paper_reconcile_failed", error=type(exc).__name__)
                 return JSONResponse({"ok": False, "error": "paper reconcile failed"}, status_code=503)
         jlog("keepalive_ok")
-        body = {"ok": True}
+        body: dict[str, Any] = {"ok": True}
+        if drained is not None:
+            body["jobs"] = drained
         if reconciled is not None:
             body["reconciled"] = reconciled
         return body
@@ -3482,31 +3530,16 @@ def create_app(settings: Optional[Settings] = None,
                                  "error": f"state store unavailable: {type(exc).__name__}"})
         return respond(200, report)
 
-    @app.post("/webhook")
-    async def webhook(request: Request):
-        try:
-            payload = json.loads(await request.body())
-            if not isinstance(payload, dict):
-                raise ValueError
-        except ValueError:
-            return respond(400, {"ok": False, "error": "body must be a JSON object"})
-        jlog("request", body=payload)
-
-        pw = str(payload.get("passphrase", ""))
-        if not s.webhook_passphrase or not hmac.compare_digest(pw.encode(), s.webhook_passphrase.encode()):
-            return respond(401, {"ok": False, "error": "unauthorized"})
-
-        alert_id = str(payload.get("alert_id", "")).strip()
-        if not alert_id:
-            return respond(422, {"ok": False, "error": "alert_id required"})
-
-        now = clock()
-        day = now.date().isoformat()
+    async def run_alert(payload: dict, alert_id: str, day: str, now: datetime) -> JSONResponse:
+        # Already authorized. WEBHOOK_ASYNC and the synchronous path both come through here,
+        # so a close is not refused for having been queued.
         try:
             if not await store.reserve(alert_id, day):
                 return respond(200, {"ok": True, "duplicate": True, "alert_id": alert_id})
         except (StoreError, httpx.HTTPError) as e:
-            return respond(503, {"ok": False, "alert_id": alert_id, "error": f"state store unavailable: {type(e).__name__}"})
+            # stage=reserve means the alert row was not written, so a later drain may try again.
+            return respond(503, {"ok": False, "alert_id": alert_id, "stage": "reserve",
+                                 "error": f"state store unavailable: {type(e).__name__}"})
         if s.mode == "PAPER":
             if alpaca is None:
                 return respond(503, {"ok": False, "alert_id": alert_id, "error": "Alpaca is not configured"})
@@ -3724,6 +3757,108 @@ def create_app(settings: Optional[Settings] = None,
             # Don't release on transport errors during LIVE place: order may have gone through.
             await store.finish(alert_id, "ERROR", mode=s.mode, detail=audit_detail(selection, error=type(e).__name__))
             return respond(502, error_body(alert_id, f"upstream error: {type(e).__name__}", selection))
+
+    def _job_status(http_status: int, attempts: int, result: Any) -> Literal["pending", "done", "error"]:
+        # Retry only a reserve that never wrote the alert. Any later 5xx already reserved it,
+        # and a second pass would come back duplicate and hide the real error.
+        if (http_status == 503 and attempts < 3 and isinstance(result, dict)
+                and result.get("stage") == "reserve"):
+            return "pending"
+        if http_status >= 500:
+            return "error"
+        return "done"
+
+    async def _finish_claimed(job: dict, http_status: int, result: Any) -> dict:
+        attempts = int(job.get("attempts") or 1)
+        status = _job_status(http_status, attempts, result)
+        await store.finish_job(int(job["id"]), status, http_status, result)
+        jlog("job_finished", alert_id=job.get("alert_id"), status=status, http_status=http_status,
+             attempts=attempts)
+        return {"id": job.get("id"), "alert_id": job.get("alert_id"), "status": status,
+                "http_status": http_status}
+
+    async def drain_jobs() -> dict:
+        # No-op unless Nick has turned the queue on, so a cron hit does not require 0007.
+        if not s.webhook_async:
+            return {"ok": True, "skipped": True, "processed": []}
+        processed: list[dict] = []
+        for _ in range(JOB_DRAIN_ROUNDS):
+            claimed = await store.claim_jobs(JOB_CLAIM_LIMIT)
+            if not claimed:
+                break
+            for job in claimed:
+                alert_id = str(job.get("alert_id") or "").strip()
+                payload = job.get("payload")
+                if not alert_id or not isinstance(payload, dict):
+                    processed.append(await _finish_claimed(
+                        job, 422, {"ok": False, "error": "job payload is not an object"}))
+                    continue
+                now = clock()
+                day = str(job.get("day") or now.date().isoformat())
+                try:
+                    response = await run_alert(payload, alert_id, day, now)
+                except (StoreError, httpx.HTTPError) as exc:
+                    processed.append(await _finish_claimed(
+                        job, 503, {"ok": False, "alert_id": alert_id,
+                                   "error": f"state store unavailable: {type(exc).__name__}"}))
+                    continue
+                try:
+                    body = json.loads(response.body)
+                except (ValueError, TypeError):
+                    body = {"ok": False, "alert_id": alert_id, "error": "job result was not JSON"}
+                processed.append(await _finish_claimed(job, response.status_code, body))
+        return {"ok": True, "processed": processed}
+
+    async def queue_alert(payload: dict, alert_id: str, day: str,
+                          background_tasks: BackgroundTasks) -> JSONResponse:
+        # The order, including a live PremarketES order, runs after this response.
+        # Off by default. Turning it on requires migration 0007.
+        try:
+            state = await store.enqueue_job(alert_id, day, job_payload(payload))
+        except (StoreError, httpx.HTTPError) as exc:
+            return respond(503, {"ok": False, "alert_id": alert_id,
+                                 "error": f"state store unavailable: {type(exc).__name__}"})
+        if state == "duplicate":
+            return respond(200, {"ok": True, "duplicate": True, "alert_id": alert_id})
+        background_tasks.add_task(drain_jobs)
+        jlog("job_queued", alert_id=alert_id)
+        return respond(200, {"ok": True, "queued": True, "alert_id": alert_id, "order_placed": False})
+
+    @app.post("/webhook")
+    async def webhook(request: Request, background_tasks: BackgroundTasks):
+        try:
+            payload = json.loads(await request.body())
+            if not isinstance(payload, dict):
+                raise ValueError
+        except ValueError:
+            return respond(400, {"ok": False, "error": "body must be a JSON object"})
+        jlog("request", body=payload)
+
+        pw = str(payload.get("passphrase", ""))
+        if not s.webhook_passphrase or not hmac.compare_digest(pw.encode(), s.webhook_passphrase.encode()):
+            return respond(401, {"ok": False, "error": "unauthorized"})
+
+        alert_id = str(payload.get("alert_id", "")).strip()
+        if not alert_id:
+            return respond(422, {"ok": False, "error": "alert_id required"})
+
+        now = clock()
+        day = now.date().isoformat()
+        if s.webhook_async:
+            return await queue_alert(payload, alert_id, day, background_tasks)
+        return await run_alert(payload, alert_id, day, now)
+
+    @app.api_route("/jobs/drain", methods=["GET", "POST"])
+    async def jobs_drain(request: Request):
+        # Same bearer as /keepalive. Vercel cron and the external monitor can both call it.
+        if not cron_authorized(request):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            report = await drain_jobs()
+        except (StoreError, httpx.HTTPError) as exc:
+            jlog("job_drain_failed", error=type(exc).__name__)
+            return JSONResponse({"ok": False, "error": "job drain failed"}, status_code=503)
+        return report
 
     return app
 

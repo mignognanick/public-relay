@@ -51,6 +51,7 @@ class FakeSupabase:
     def __init__(self, fail=False, missing_position_rpc=False):
         self.alerts, self.counters, self.fail, self.calls = {}, {}, fail, []
         self.positions, self.picks, self.exit_orders, self.levels = {}, [], {}, {}
+        self.jobs, self.job_seq = {}, 0
         self.missing_position_rpc = missing_position_rpc
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
@@ -212,6 +213,42 @@ class FakeSupabase:
         if p == "/rest/v1/contract_picks" and req.method == "POST":
             self.picks.append(b)
             return httpx.Response(201, content=b"", headers={"content-type": "application/json"})
+        if p == "/rest/v1/rpc/relay_enqueue_job":
+            aid = b["p_alert_id"]
+            if aid in self.jobs:
+                return httpx.Response(200, json="duplicate")
+            self.job_seq += 1
+            self.jobs[aid] = {
+                "id": self.job_seq, "alert_id": aid, "day": b["p_day"], "payload": b["p_payload"],
+                "status": "pending", "attempts": 0, "http_status": None, "result": None,
+                "locked_at": None,
+            }
+            return httpx.Response(200, json="queued")
+        if p == "/rest/v1/rpc/relay_claim_jobs":
+            limit = int(b.get("p_limit") or 8)
+            claimed = []
+            for row in self.jobs.values():
+                stale = row["status"] == "running" and row.get("locked_at") == "stale"
+                if row["attempts"] >= 3 or not (row["status"] == "pending" or stale):
+                    continue
+                row["status"] = "running"
+                row["attempts"] += 1
+                row["locked_at"] = "now"
+                claimed.append(dict(row))
+                if len(claimed) >= limit:
+                    break
+            return httpx.Response(200, json=claimed)
+        if p == "/rest/v1/rpc/relay_finish_job":
+            for row in self.jobs.values():
+                if row["id"] != b["p_id"]:
+                    continue
+                row["status"] = b["p_status"]
+                row["http_status"] = b["p_http_status"]
+                row["result"] = b["p_result"]
+                if b["p_status"] == "pending":
+                    row["locked_at"] = None
+                return httpx.Response(204)
+            return httpx.Response(200, content=b"null", headers={"content-type": "application/json"})
         return httpx.Response(404)
 
 
@@ -482,7 +519,7 @@ def test_keepalive(tmp_path, monkeypatch):
     assert c.get("/keepalive", headers={"Authorization": "Bearer nope"}).status_code == 401
     r = c.get("/keepalive", headers={"Authorization": "Bearer cron-s"})
     assert r.status_code == 200 and r.json()["ok"] is True
-    assert "reconciled" not in r.json()
+    assert "reconciled" not in r.json() and "jobs" not in r.json()
     assert any(x.url.path == "/rest/v1/daily_counters" for x in c.sb.calls)
     assert not any(x.url.path.endswith("relay_list_open_positions") for x in c.sb.calls)
     assert fake.calls == []  # never touches Public
@@ -1063,6 +1100,7 @@ def test_health_lists_tunables(tmp_path):
     assert settings["max_premium"] == "5.00" and settings["max_exit_orders_per_day"] == 6
     assert settings["open_limit_fallback"] == "ask" and settings["close_limit_fallback"] == "bid"
     assert settings["stop_loss_percent"] is None and settings["alpaca_configured"] is False
+    assert settings["webhook_async"] is False
     assert settings["daily_caps"] == "shared"
     qqq = settings["strategies"]["QQQ_EMA_VWAP"]
     assert qqq["delta_band_min"] == "0.60" and qqq["delta_band_max"] == "0.75"
@@ -2122,3 +2160,161 @@ def test_preflight_failure_still_places_nothing(tmp_path):
     assert not ending(fake, "/order")
     assert client.sb.positions == {} and client.sb.counters == {} and client.sb.alerts == {}
     assert _write_paths(client) == []
+
+
+def test_webhook_stays_synchronous_without_the_flag(tmp_path):
+    c, fake = make(tmp_path)
+    response = c.post("/webhook", json=alert())
+    assert response.status_code == 200, response.text
+    assert response.json()["mode"] == "PREFLIGHT" and "queued" not in response.json()
+    assert c.sb.jobs == {}
+    assert fake.calls
+
+
+def test_async_ack_returns_before_the_order_is_described(tmp_path):
+    c, fake = make(tmp_path, WEBHOOK_ASYNC="true")
+    response = c.post("/webhook", json=alert())
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True, "queued": True, "alert_id": "a1", "order_placed": False}
+    job = c.sb.jobs["a1"]
+    assert job["status"] == "done" and job["http_status"] == 200
+    assert job["result"]["mode"] == "PREFLIGHT" and job["result"]["order_placed"] is False
+    assert "passphrase" not in job["payload"] and PASS not in json.dumps(job)
+    assert fake.calls
+
+
+def test_async_paper_order_lands_on_the_job(tmp_path):
+    client, public, broker = _paper(tmp_path, STOP_LOSS_PERCENT="", WEBHOOK_ASYNC="true")
+    response = client.post("/webhook", json=alert(alert_id="occ-async"))
+    assert response.status_code == 200, response.text
+    assert response.json()["queued"] is True and response.json()["order_placed"] is False
+    job = client.sb.jobs["occ-async"]
+    assert job["status"] == "done" and job["http_status"] == 200
+    assert job["result"]["order_placed"] is True and job["result"]["broker"] == "alpaca"
+    assert "passphrase" not in job["payload"] and PASS not in json.dumps(job)
+    assert broker.posts()[0]["symbol"] == "AAPL261120C00250000"
+    assert broker.posts()[0]["position_intent"] == "buy_to_open"
+    assert not ending(public, "/order")
+
+
+def test_async_duplicate_and_a_rerun_do_not_call_the_broker_again(tmp_path, monkeypatch):
+    monkeypatch.setenv("CRON_SECRET", "cron-s")
+    c, fake = make(tmp_path, WEBHOOK_ASYNC="true")
+    assert c.post("/webhook", json=alert()).json()["queued"] is True
+    assert c.sb.jobs["a1"]["status"] == "done"
+    calls = len(fake.calls)
+    again = c.post("/webhook", json=alert())
+    assert again.status_code == 200 and again.json()["duplicate"] is True
+    assert len(fake.calls) == calls
+    c.sb.jobs["a1"]["status"] = "pending"
+    c.sb.jobs["a1"]["attempts"] = 1
+    c.sb.jobs["a1"]["locked_at"] = None
+    drained = c.post("/jobs/drain", headers={"Authorization": "Bearer cron-s"})
+    assert drained.status_code == 200, drained.text
+    assert c.sb.jobs["a1"]["status"] == "done"
+    assert c.sb.jobs["a1"]["result"]["duplicate"] is True
+    assert len(fake.calls) == calls
+
+
+def test_async_close_still_runs_when_the_entry_cap_is_full(tmp_path):
+    c, _fake = make(tmp_path, WEBHOOK_ASYNC="true", MAX_ORDERS_PER_DAY="1")
+    opened = c.post("/webhook", json=alert(alert_id="open"))
+    assert opened.status_code == 200 and opened.json()["queued"] is True
+    assert c.sb.jobs["open"]["http_status"] == 200
+    closed = c.post("/webhook", json=alert(
+        alert_id="close", side="SELL", open_close="CLOSE", limit_price="1.00"))
+    assert closed.status_code == 200 and closed.json()["queued"] is True
+    assert c.sb.jobs["close"]["status"] == "done"
+    assert c.sb.jobs["close"]["http_status"] == 200
+    assert c.sb.jobs["close"]["result"]["ok"] is True
+
+
+def test_async_rejects_auth_before_enqueue(tmp_path):
+    c, fake = make(tmp_path, WEBHOOK_ASYNC="true")
+    assert c.post("/webhook", json=alert(passphrase="wrong")).status_code == 401
+    assert c.post("/webhook", json=alert(alert_id="")).status_code == 422
+    assert c.sb.jobs == {} and fake.calls == []
+
+
+def test_async_enqueue_failure_places_nothing(tmp_path):
+    sb = FakeSupabase(fail=True)
+    c, fake = make(tmp_path, sb=sb, WEBHOOK_ASYNC="true")
+    response = c.post("/webhook", json=alert())
+    assert response.status_code == 503, response.text
+    assert fake.calls == [] and sb.jobs == {}
+
+
+def test_async_store_blip_retries_then_stops(tmp_path):
+    class ReserveDown(FakeSupabase):
+        def __call__(self, req: httpx.Request) -> httpx.Response:
+            if req.url.path == "/rest/v1/rpc/relay_reserve":
+                return httpx.Response(503)
+            return super().__call__(req)
+
+    sb = ReserveDown()
+    c, fake = make(tmp_path, sb=sb, WEBHOOK_ASYNC="true")
+    response = c.post("/webhook", json=alert())
+    assert response.status_code == 200 and response.json()["queued"] is True
+    job = sb.jobs["a1"]
+    assert job["status"] == "error" and job["attempts"] == 3 and job["http_status"] == 503
+    assert fake.calls == []
+
+
+def test_drain_requires_the_cron_secret_and_idles_while_async_is_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("CRON_SECRET", "cron-s")
+    c, _fake = make(tmp_path)
+    assert c.get("/jobs/drain").status_code == 401
+    assert c.post("/jobs/drain", headers={"Authorization": "Bearer nope"}).status_code == 401
+    idle = c.get("/jobs/drain", headers={"Authorization": "Bearer cron-s"})
+    assert idle.status_code == 200 and idle.json()["skipped"] is True
+    assert c.sb.jobs == {}
+    assert not any("relay_claim_jobs" in call.url.path for call in c.sb.calls)
+
+
+def test_stale_job_and_keepalive_each_run_the_alert_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("CRON_SECRET", "cron-s")
+    c, fake = make(tmp_path, WEBHOOK_ASYNC="true")
+    held = alert(alert_id="held")
+    held.pop("passphrase")
+    c.sb.jobs["held"] = {
+        "id": 1, "alert_id": "held", "day": "2026-10-19", "payload": held,
+        "status": "running", "attempts": 1, "http_status": None, "result": None,
+        "locked_at": "stale",
+    }
+    drained = c.post("/jobs/drain", headers={"Authorization": "Bearer cron-s"})
+    assert drained.status_code == 200, drained.text
+    assert c.sb.jobs["held"]["status"] == "done" and c.sb.jobs["held"]["attempts"] == 2
+    calls = len(fake.calls)
+    again = c.post("/jobs/drain", headers={"Authorization": "Bearer cron-s"})
+    assert again.json()["processed"] == []
+    assert len(fake.calls) == calls
+
+    later = alert(alert_id="later")
+    later.pop("passphrase")
+    c.sb.jobs["later"] = {
+        "id": 2, "alert_id": "later", "day": "2026-10-19", "payload": later,
+        "status": "pending", "attempts": 0, "http_status": None, "result": None,
+        "locked_at": None,
+    }
+    kept = c.get("/keepalive", headers={"Authorization": "Bearer cron-s"})
+    assert kept.status_code == 200, kept.text
+    assert kept.json()["jobs"]["processed"][0]["alert_id"] == "later"
+    assert c.sb.jobs["later"]["status"] == "done"
+    assert "passphrase" not in json.dumps(c.sb.jobs)
+
+
+def test_async_preflight_failure_is_kept_and_not_run_again(tmp_path):
+    class Down(FakePublic):
+        def __call__(self, req: httpx.Request) -> httpx.Response:
+            if req.url.path.endswith("/preflight/single-leg"):
+                self.calls.append(req)
+                return httpx.Response(500, json={"error": "down"})
+            return FakePublic.__call__(self, req)
+
+    c, fake = make(tmp_path, public=Down(), WEBHOOK_ASYNC="true")
+    response = c.post("/webhook", json=alert())
+    assert response.status_code == 200 and response.json()["queued"] is True
+    job = c.sb.jobs["a1"]
+    assert job["status"] == "error" and job["attempts"] == 1 and job["http_status"] == 502
+    assert job["result"]["stage"] == "preflight" and job["result"].get("duplicate") is not True
+    assert sum(1 for path in fake.paths() if path.endswith("/preflight/single-leg")) == 1
