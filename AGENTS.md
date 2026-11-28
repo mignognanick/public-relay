@@ -85,7 +85,9 @@ python -m pytest -q tests research/tests quant_engine/tests
 | `api/index.py`, `api/flowvwap.py`, `app.py` | The production relay (Vercel). |
 | `supabase/migrations/` | Ordered SQL; apply in order. |
 | `tradingview/` | Pine strategies. |
-| `research/` | Backtester, pricing model, results. |
+| `research/` | Backtester, pricing model, results, research-only VectorBT adapter. |
+| `requirements-research.txt` | Optional research extras. Not installed on the production relay. |
+| `docs/QUANT_RESEARCH_AUDIT.md` | Open-source research audit and phase status. |
 | `quant_engine/risk/` | Standalone portfolio risk engine. |
 | `docs/ARCHITECTURE.md` | Current architecture and known weaknesses. |
 | `docs/RISK_ENGINE.md` | Risk engine design and API. |

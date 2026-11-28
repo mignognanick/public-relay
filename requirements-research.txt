@@ -1,0 +1,8 @@
+# Research-only extras. Do not install these into the production relay image.
+# The Vercel app stays on requirements.txt (fastapi, httpx) and requirements-dashboard.txt.
+#
+# vectorbt 1.2.1 is Apache-2.0 with the Commons Clause. Use it for internal research.
+# Do not resell vectorbt or ship a product whose value is substantially vectorbt.
+# Install the core package only. The "full" extra pulls brokerage and vendor downloaders
+# (alpaca-py, ccxt, yfinance) and is intentionally not listed here.
+vectorbt==1.2.1
