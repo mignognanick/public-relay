@@ -10,6 +10,7 @@ const sections = {
   swing: "Swing Trading",
   long_term: "Long-Term Investing",
   lab: "Strategy Lab",
+  alpha: "Alpha Center",
   control: "Control Center",
   tax: "Tax Center",
 };
@@ -128,6 +129,9 @@ async function change(action, target, values, why) {
   });
   render();
   notify("Saved version " + data.version + ". Execution remains disconnected.");
+  if (page === "alpha" && typeof loadAlpha === "function") {
+    loadAlpha();
+  }
   try {
     history = await api("/api/history");
     if (page === "control") render();
@@ -144,6 +148,7 @@ function signOut() {
   history = [];
   accounts = { execution_active: false, accounts: [] };
   clearResearch();
+  if (typeof clearAlpha === "function") clearAlpha();
   $("content").replaceChildren();
   $("workspace").hidden = true;
   $("login").hidden = false;
@@ -252,11 +257,18 @@ function render() {
       ? overview()
       : page === "lab"
         ? lab()
-        : page === "control"
-          ? control()
-          : page === "tax"
-            ? tax()
-            : portfolio(page);
+        : page === "alpha"
+          ? typeof alphaPanel === "function"
+            ? alphaPanel()
+            : ""
+          : page === "control"
+            ? control()
+            : page === "tax"
+              ? tax()
+              : portfolio(page);
+  if (page === "alpha" && typeof ensureAlphaLoaded === "function") {
+    ensureAlphaLoaded();
+  }
 }
 document.addEventListener("click", (event) => {
   const target = event.target.closest("[data-page]");
@@ -268,7 +280,7 @@ document.addEventListener("click", (event) => {
 });
 $("content").addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (event.target.dataset.research) return;
+  if (event.target.dataset.research || event.target.dataset.alpha) return;
   const form = event.target,
     fields = Object.fromEntries(new FormData(form)),
     action = form.dataset.action;
@@ -277,6 +289,17 @@ $("content").addEventListener("submit", async (event) => {
   let values = fields;
   if (action === "global_pause")
     values = { paused: form.elements.paused.checked };
+  if (action === "allocation_model")
+    values = { allocation_model: fields.allocation_model };
+  if (action === "strategy_permissions") {
+    const selectedRegimes = Array.from(
+      form.querySelectorAll('input[name="regimes"]:checked'),
+    ).map((el) => el.value);
+    values = {
+      enabled: form.elements.enabled.checked,
+      regimes: selectedRegimes,
+    };
+  }
   if (action === "portfolio")
     values = {
       ...fields,

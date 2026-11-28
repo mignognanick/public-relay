@@ -12,8 +12,10 @@ from quant_engine.risk.config import RiskConfig
 Regime = Literal['strong_bull', 'bull', 'chop', 'bear', 'strong_bear', 'high_volatility']
 PortfolioID = Literal['day', 'swing', 'long_term']
 Stage = Literal['idea', 'specified', 'backtested', 'validated', 'paper', 'archived']
+AllocationModelID = Literal['v1', 'v2', 'v3']
 REGIMES = ['strong_bull', 'bull', 'chop', 'bear', 'strong_bear', 'high_volatility']
 STAGES = ['idea', 'specified', 'backtested', 'validated', 'paper', 'archived']
+ALLOCATION_MODELS = ['v1', 'v2', 'v3']
 
 
 class Model(BaseModel):
@@ -64,6 +66,7 @@ class Tax(Model):
 class State(Model):
     execution: Literal['PAPER'] = 'PAPER'
     paused: StrictBool = True
+    allocation_model: AllocationModelID = 'v1'
     portfolios: list[Portfolio]
     strategies: list[Strategy] = Field(default_factory=list)
     tax: Tax = Field(default_factory=Tax)
@@ -87,7 +90,7 @@ def initial_state():
 
 class Command(Model):
     version: int = Field(ge=0, strict=True)
-    action: Literal['global_pause', 'portfolio', 'create_strategy', 'strategy', 'tax']
+    action: Literal['global_pause', 'portfolio', 'create_strategy', 'strategy', 'strategy_permissions', 'allocation_model', 'tax']
     target: str = Field(default='', max_length=100)
     reason: str = Field(min_length=3, max_length=500)
     values: dict
@@ -142,6 +145,20 @@ def transition(state: State, command: Command, actor: str, now: datetime):
         if updated.enabled and updated.stage != 'paper':
             raise ValueError('Only human-approved paper strategies can be enabled')
         result.strategies[result.strategies.index(strategy)] = updated
+    elif command.action == 'strategy_permissions':
+        strategy = next((s for s in result.strategies if s.id == command.target), None)
+        if strategy is None:
+            raise ValueError('Unknown strategy')
+        if strategy.stage != 'paper' or not strategy.approved_by:
+            raise ValueError('Permissions can only be changed on human-approved paper strategies')
+        if not set(values) <= {'enabled', 'regimes'} or not values:
+            raise ValueError('Supply enabled and/or regimes for paper strategy permissions')
+        updated = Strategy.model_validate(strategy.model_dump() | values)
+        result.strategies[result.strategies.index(strategy)] = updated
+    elif command.action == 'allocation_model':
+        if set(values) != {'allocation_model'} or values['allocation_model'] not in ALLOCATION_MODELS:
+            raise ValueError('Supply allocation_model as v1, v2, or v3')
+        result.allocation_model = values['allocation_model']
     elif command.action == 'tax':
         result.tax = Tax.model_validate(result.tax.model_dump() | values)
     else:

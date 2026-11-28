@@ -373,6 +373,57 @@ a:focus-visible {
 [hidden] {
   display: none !important;
 }
+.badge-warn {
+  border-color: #6b433a;
+  color: #ffb7a7;
+  background: #33201d;
+}
+.heatmap th,
+.heatmap td {
+  text-align: center;
+}
+.corr-cell {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.corr-diag {
+  background: #232c2f;
+  color: var(--muted);
+}
+.corr-pos-high {
+  background: #3d2424;
+  color: #ffc5bd;
+}
+.corr-pos-mid {
+  background: #2f2a20;
+  color: #ebd59c;
+}
+.corr-neutral {
+  background: #172022;
+  color: var(--text);
+}
+.corr-neg-mid {
+  background: #1c2e28;
+  color: #a9e6c7;
+}
+.corr-neg-high {
+  background: #1d3927;
+  color: var(--accent);
+}
+.perm-item {
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+  margin-top: 16px;
+}
+.regime-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.regime-check {
+  padding: 4px 0;
+}
 @media (max-width: 1000px) {
   .grid,
   .two {
@@ -389,6 +440,9 @@ a:focus-visible {
   }
 }
 @media (max-width: 650px) {
+  .regime-grid {
+    grid-template-columns: 1fr;
+  }
   aside {
     position: static;
     width: auto;
