@@ -27,6 +27,9 @@ Quant Engine V1 work lives on `dev/quant-engine`. Start with `AGENTS.md`. The st
   `0006_flowvwap_levels.sql` adds the entry underlying prices and `daily_levels`. Apply it
   after `0005` before this version serves FlowVWAP. QQQ opens still record if the new
   columns are left null.
+  `0007_relay_jobs.sql` adds `relay_jobs` and the enqueue, claim, and finish functions.
+  Apply it after `0006` before setting `WEBHOOK_ASYNC`. Until that variable is set, `/webhook`
+  does not call them and the live book is unchanged.
   `underlying_price` (`{{close}}`) sets ATM; if it is missing, the relay uses the equity quote.
   The pick is written to `contract_picks` and returned as `selection`, with the order that would have been
   sent as `order`. Templates are in `sample_alert.json`. Defaults stay MODE=PREFLIGHT.
@@ -35,7 +38,8 @@ Quant Engine V1 work lives on `dev/quant-engine`. Start with `AGENTS.md`. The st
   is sent to `/order`, including when an entry itself is live. See the settings table.
 - Public token cached per warm instance, refreshed 2 min before expiry or on 401.
 - Tests: `pip install -r requirements.txt -r requirements-dev.txt && pytest -q tests` (Public + Supabase mocked).
-- Endpoints: `GET /health` (includes the non-secret `settings` block), `POST /webhook`, `POST /preflight`.
+- Endpoints: `GET /health` (includes the non-secret `settings` block), `POST /webhook`, `POST /preflight`,
+  `GET` or `POST /jobs/drain` (bearer `CRON_SECRET`; runs queued alerts when `WEBHOOK_ASYNC` is on).
 
 Tunables are read from the environment when the instance starts. Changing one needs a restart (or a new
 Vercel deployment that already has the variable). This repo does not set them. `MODE` and `LIVE_CONFIRM`
@@ -75,7 +79,8 @@ are unchanged: LIVE still requires both `MODE=LIVE` and `LIVE_CONFIRM=I_UNDERSTA
 | `STOP_LOSS_PERCENT` | empty | Off when empty. When set, stop price is entry × (1 − this / 100), then rounded to the option tick. `30` on a 1.45 entry is 1.015, which is sent as 1.02. Must be greater than 0 and less than 100. Overridable per strategy. `null` in a profile turns the stop off for that strategy even when this variable is set. |
 | `SUPABASE_URL` | empty | Project URL. |
 | `SUPABASE_SERVICE_KEY` | empty | Service-role key. Server only. |
-| `CRON_SECRET` | empty | Bearer token for `GET /keepalive`. |
+| `CRON_SECRET` | empty | Bearer token for `GET /keepalive` and `/jobs/drain`. |
+| `WEBHOOK_ASYNC` | `false` | When `true`, `/webhook` stores the alert on `relay_jobs` and returns `200` with `queued: true`. The order runs in a background task after that response, and again from `/jobs/drain` or `/keepalive` if that task dies. A duplicate `alert_id` does not run twice. Requires migration `0007`. Leave unset until Nick applies it. The live PremarketES order moves to after the HTTP response only when this is on. |
 
 `/health` returns every tunable above except the secrets. `settings.strategies` is the effective per-strategy block (built-in profiles plus `STRATEGY_OVERRIDES`). A strategy that is not listed there uses the global `settings` values. `FlowVWAP`, `QQQ_EMA_VWAP`, `PremarketES`, and `PremarketES_MU` are listed. `settings.daily_caps` is `shared` for the paper and preflight books. `settings.live_strategies` and the `live_max_*` fields are the live ceiling, which is `PremarketES` only. `live_account_configured` is true when `PUBLIC_ACCOUNT_ID` is set. The account id itself is not returned.
 
